@@ -37,7 +37,7 @@ class SimNoiseConfig:
 
 @dataclass
 class RoomConfig:
-    """사각형 실내 공간(벽)"""
+    """사각형 실내 공간(벽) (map.py 의 Map)"""
     x_min: float = -15.0
     x_max: float = 15.0
     y_min: float = -5.0
@@ -47,7 +47,7 @@ class RoomConfig:
 
 @dataclass
 class ImageMapConfig:
-    """손그림 지도 (maptograph)"""
+    """손그림 지도 (map.py 의 GridMap)"""
     use_image_map: bool = True  # True: 이미지에서 만든 지도 사용, False: 사각형 방(RoomConfig) 사용
     image: str = os.path.join(HERE, "input_image", "Untitled.png")  # 손으로 그린 평면도 이미지
     resolution: float = 0.03  # 이미지 한 픽셀의 실제 길이 [m/px]

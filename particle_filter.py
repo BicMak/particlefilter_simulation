@@ -5,7 +5,7 @@ Particle Filter localization sample
 
 [이 파일 설명]
 python robotics 의 Particle Filter 예제 코드를 기반으로,
-사각형 실내 공간(벽) 안에서 로봇이 움직이고, 벽 경계에서 랜덤 샘플링한
+실내 공간(벽) 안에서 로봇이 움직이고, 벽에서 랜덤 샘플링한
 레퍼런스 포인트까지의 "거리"만 관측해서 파티클 필터로 로봇 위치를 추정한다.
 
 전체 흐름 (매 time step):
@@ -21,8 +21,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Polygon, Wedge
 
-from config import Config, KeyboardConfig, RobotConfig, RoomConfig, SimNoiseConfig
-from maptograph import GridMap
+from config import Config, KeyboardConfig, RobotConfig, SimNoiseConfig
+from map import build_map
 
 
 def rot_mat_2d(angle):
@@ -30,48 +30,6 @@ def rot_mat_2d(angle):
     c, s = math.cos(angle), math.sin(angle)
     return np.array([[c, -s],
                      [s, c]])
-
-
-class Map:
-    """사각형 실내 공간(벽)과, 벽 위에서 샘플링한 레퍼런스 포인트(landmark)를 가진 지도"""
-
-    def __init__(self, cfg: RoomConfig, rng=None):
-        self.x_min, self.x_max = cfg.x_min, cfg.x_max
-        self.y_min, self.y_max = cfg.y_min, cfg.y_max
-        # 벽 경계에서 랜덤 샘플링한 레퍼런스 포인트들 [x, y]
-        self.rf_id = self.sample_wall_points(cfg.n_ref, rng)
-
-    def sample_wall_points(self, n, rng=None):
-        """
-        사각형 방의 경계(벽) 위에서 n개의 점을 랜덤 샘플링한다.
-        둘레 길이(arc length) 기준으로 균등하게 뽑는다.
-        -> 긴 벽에 점이 더 많이 생기고, 모든 위치가 같은 확률로 뽑힘
-        """
-        rng = np.random.default_rng() if rng is None else rng
-        w = self.x_max - self.x_min  # 가로 길이
-        h = self.y_max - self.y_min  # 세로 길이
-        # 둘레 위의 위치 s를 [0, 둘레) 에서 균등 샘플링 (둘레 = 2(w+h))
-        s = rng.uniform(0.0, 2.0 * (w + h), n)
-
-        # s를 실제 (x, y) 좌표로 변환: 아래벽 -> 오른벽 -> 위벽 -> 왼벽 순으로 반시계 방향
-        pts = np.zeros((n, 2))
-        for i, si in enumerate(s):
-            if si < w:  # 아래쪽 벽
-                pts[i] = [self.x_min + si, self.y_min]
-            elif si < w + h:  # 오른쪽 벽
-                pts[i] = [self.x_max, self.y_min + (si - w)]
-            elif si < 2 * w + h:  # 위쪽 벽
-                pts[i] = [self.x_max - (si - w - h), self.y_max]
-            else:  # 왼쪽 벽
-                pts[i] = [self.x_min, self.y_max - (si - 2 * w - h)]
-        return pts
-
-    def plot(self):  # pragma: no cover
-        """방의 벽을 회색 굵은 선으로 그리고, 레퍼런스 포인트를 검은 별로 그린다"""
-        xs = [self.x_min, self.x_max, self.x_max, self.x_min, self.x_min]
-        ys = [self.y_min, self.y_min, self.y_max, self.y_max, self.y_min]
-        plt.plot(xs, ys, "-", color="gray", linewidth=3)
-        plt.plot(self.rf_id[:, 0], self.rf_id[:, 1], "*k")
 
 
 class Robot:
@@ -87,7 +45,7 @@ class Robot:
           cfg       : RobotConfig (particle, Q, R, dt, max_range, fov, n_threshold_ratio, v, yaw_rate). Q, R = 필터가 믿는 노이즈
           sim_noise : SimNoiseConfig. 시뮬레이션에서 센서 측정값/입력에 실제로 섞이는 노이즈 (필터는 모름)
           x0    : 초기 상태 [x, y, yaw, v] (기본: 원점)
-          world : GridMap. 주면 실제 로봇이 벽을 못 뚫고, 벽에 가린 레퍼런스는 관측 안 됨
+          world : GridMap(map.py). 주면 실제 로봇이 벽을 못 뚫고, 벽에 가린 레퍼런스는 관측 안 됨
         """
         x0 = np.zeros((4, 1)) if x0 is None else np.array(x0, dtype=float).reshape(4, 1)
         self.x_true = x0.copy()
@@ -405,13 +363,8 @@ def main(config=None):
     cfg = Config() if config is None else config
     viz, kb = cfg.viz, cfg.keyboard
     time = 0.0
-    if cfg.image_map.use_image_map:
-        im = cfg.image_map
-        room = GridMap.from_image(im.image, resolution=im.resolution, n_ref=im.n_ref)  # 손그림 지도
-        robot = Robot(cfg.robot, cfg.sim_noise, x0=im.robot_start, world=room)  # 실제 로봇 + Dead Reckoning
-    else:
-        room = Map(cfg.room)  # 벽 + 레퍼런스 포인트 (landmark)
-        robot = Robot(cfg.robot, cfg.sim_noise)  # 실제 로봇 + Dead Reckoning
+    room, x0, world = build_map(cfg)  # 지도 (벽 + 레퍼런스 포인트) 생성: map.py
+    robot = Robot(cfg.robot, cfg.sim_noise, x0=x0, world=world)  # 실제 로봇 + Dead Reckoning
 
     # 상태 벡터 [x y yaw v]'
     x_est = robot.x_true.copy()  # 필터 추정값
