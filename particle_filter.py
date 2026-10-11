@@ -16,12 +16,14 @@ python robotics 의 Particle Filter 예제 코드를 기반으로,
 
 """
 import math
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Polygon, Wedge
 
 from config import Config, KeyboardConfig, RobotConfig, SimNoiseConfig
+from lidar_to_grid_map import MapBuilder, scan_to_world  # 탐색한 정보로 만드는 픽셀맵 (객체로 관리)
 from map import build_map
 
 
@@ -57,6 +59,7 @@ class Robot:
         self.dt = cfg.dt
         self.max_range = cfg.max_range
         self.fov = cfg.fov
+        self.n_rays = cfg.n_rays  # 0 이면 고정 레퍼런스, 1 이상이면 시야각 광선으로 관측점 생성
         self.world = world
 
         # noise covariance
@@ -133,7 +136,8 @@ class Robot:
     def observation(self, u, rf_id):
         """
         시뮬레이션 한 step 진행. x_true, x_dr를 갱신하고 (z, ud)를 반환한다.
-          z  : 관측값. 각 행이 [노이즈 낀 거리, 레퍼런스 x, 레퍼런스 y]
+          z  : 관측값. 각 행이 [노이즈 낀 거리, 레퍼런스 x, 레퍼런스 y, 빔 각도]
+               빔 각도: 로봇이 보는 방향(실제 yaw) 기준으로 잰 상대 각도 [rad] (-pi ~ pi, 왼쪽이 +)
           ud : 노이즈 낀 입력 (파티클 필터의 예측 단계에 사용)
         """
         x_next = self.motion_model(self.x_true, u)
@@ -143,7 +147,12 @@ class Robot:
             x_next[3, 0] = 0.0
         self.x_true = x_next
 
-        z = np.zeros((0, 3))
+        # 광선 모드: 지금 시야각 안에서 실제로 보이는 벽 위의 점들을 관측 대상(레퍼런스)으로 쓴다
+        if self.n_rays > 0 and hasattr(self.world, "raycast"):
+            rf_id = self.world.raycast(self.x_true[0, 0], self.x_true[1, 0], self.x_true[2, 0],
+                                       self.fov, self.max_range, self.n_rays)
+
+        z = np.zeros((0, 4))
 
         for i in range(len(rf_id[:, 0])):
 
@@ -164,7 +173,7 @@ class Robot:
                 # 관측치에도 노이즈가 있다고 가정, 
                 # 즉 Rfid-to-robot 거리 측정 센서가 오차를 갖는다고 가정
                 dn = d + np.random.randn() * np.sqrt(self.Q_sim[0, 0])
-                zi = np.array([[dn, rf_id[i, 0], rf_id[i, 1]]])
+                zi = np.array([[dn, rf_id[i, 0], rf_id[i, 1], bearing]])
                 z = np.vstack((z, zi))
 
 
@@ -322,10 +331,11 @@ class KeyboardController:
         self.keys = set()  # 현재 눌려있는 키
         self.v = 0.0
         self.yaw_rate = 0.0
+        self.quit = False  # esc 를 누르거나 창을 닫으면 True -> main 루프가 끝나고 지도가 저장됨
 
     def on_press(self, event):  # pragma: no cover
         if event.key == 'escape':
-            exit(0)
+            self.quit = True  # exit(0) 으로 바로 죽으면 저장 코드가 안 돌아서, 플래그만 세우고 루프가 끝나게 한다
         elif event.key == ' ':
             self.v, self.yaw_rate = 0.0, 0.0
         else:
@@ -357,14 +367,51 @@ class KeyboardController:
         return self.v, self.yaw_rate
 
 
+def draw_map(ax, builder, max_grid_cells=300):
+    """
+    ax 에 격자 지도를 그린다: 칸 경계선을 긋고, 알게 된 칸만 색을 칠한다.
+    (광선이 지나간 빈 칸 = 초록, 막힌 칸 = 빨강, 아직 모르는 칸 = 흰색)
+    (칸이 한 축에 max_grid_cells 개를 넘으면 선이 화면을 덮으니 경계선은 생략)
+    return : imshow 객체 (매 step 마다 .set_data(builder.explored_view()) 로 갱신)
+    """
+    cmap = plt.get_cmap("RdYlGn_r").copy()
+    cmap.set_bad("white")
+    img = ax.imshow(builder.explored_view(), cmap=cmap, vmin=0, vmax=1, origin="upper",
+                    extent=builder.extent, interpolation="nearest")  # nearest: 칸 사이를 섞지 않고 네모로
+    if max(builder.shape) <= max_grid_cells:
+        ax.set_xticks(np.linspace(builder.x_min, builder.x_max, builder.width + 1), minor=True)
+        ax.set_yticks(np.linspace(builder.y_min, builder.y_max, builder.height + 1), minor=True)
+        ax.grid(True, which="minor", color="gray", linewidth=0.3, alpha=0.6)
+        ax.tick_params(which="minor", length=0)
+    return img
+
+
+def save_map_image(builder, path):
+    """격자 지도를 이미지 파일(png 등)로 저장 (칸 경계선 + 막힌 칸 색칠 + colorbar)"""
+    fig, ax = plt.subplots(figsize=(6, 6))
+    img = draw_map(ax, builder)
+    fig.colorbar(img, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title("Grid map (resolution %.3f m/px)" % builder.resolution)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main(config=None):
     print(__file__ + " start!!")
 
     cfg = Config() if config is None else config
-    viz, kb = cfg.viz, cfg.keyboard
+    viz, kb, mapping = cfg.viz, cfg.keyboard, cfg.mapping
     time = 0.0
     room, x0, world = build_map(cfg)  # 지도 (벽 + 레퍼런스 포인트) 생성: map.py
     robot = Robot(cfg.robot, cfg.sim_noise, x0=x0, world=world)  # 실제 로봇 + Dead Reckoning
+    builder = MapBuilder.from_map(room, mapping.resolution, mapping.use_flood_fill) if mapping.enabled else None  # 탐색한 정보로 지도 그리기
+
+    def save_map():
+        #탐색한 격자 지도를 이미지로 저장 (mapping.save_path)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), mapping.save_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        save_map_image(builder, path)
+        print("map saved ->", path)
 
     # 상태 벡터 [x y yaw v]'
     x_est = robot.x_true.copy()  # 필터 추정값
@@ -377,17 +424,41 @@ def main(config=None):
     # 키보드 조작: 방향키로 속도/각속도 지령을 바꾼다 (정지 상태에서 시작)
     cmd = {"v": 0.0, "yaw_rate": 0.0}
     ctrl = None
+
+    # 화면: 왼쪽 = 탐색한 정보로 그린 지도, 오른쪽 = 시뮬레이션 (실제 로봇, 파티클, 추정)
+    ax_map = ax_sim = None
+    if viz.show_animation:
+        if builder is not None:
+            fig, (ax_map, ax_sim) = plt.subplots(1, 2, figsize=(2 * viz.figsize[0], viz.figsize[1]),
+                                                 gridspec_kw={"wspace": 0.4})  # 좌우 사이를 벌려서 글자끼리 안 겹치게
+            # 격자 지도: 칸 경계선을 긋고, 광선이 지나간 칸(초록)과 막힌 칸(빨강)에 색을 칠한다 (draw_map)
+            map_img = draw_map(ax_map, builder)
+            # colorbar(범례)는 지도 오른쪽 바로 옆에 붙인다. 지도 축 좌표 기준이라 지도 크기가 바뀌어도 따라가고, 지도의 공간을 떼지 않는다
+            ax_cb = ax_map.inset_axes([1.02, 0.0, 0.035, 1.0])
+            fig.colorbar(map_img, cax=ax_cb, label="occupancy probability")
+            map_true, = ax_map.plot([], [], "o", color="royalblue", ms=7)  # 실제 로봇
+            map_est, = ax_map.plot([], [], "o", color="red", ms=4)  # 필터 추정 위치
+            ax_map.set_title("explored grid map (%s pose)\ngreen=free  red=occupied  white=unknown"
+                             % ("estimated" if mapping.use_estimated_pose else "true"), fontsize=9)
+        else:
+            fig, ax_sim = plt.subplots(figsize=viz.figsize)
+
     if kb.enabled and viz.show_animation:
         for k in ("keymap.back", "keymap.forward"):  # 좌/우 방향키가 matplotlib 단축키와 겹치지 않게
             plt.rcParams[k] = [key for key in plt.rcParams[k] if key not in ("left", "right")]
         ctrl = KeyboardController(kb, dt=robot.dt)
-        canvas = plt.figure().canvas
-        canvas.mpl_connect('key_press_event', ctrl.on_press)
-        canvas.mpl_connect('key_release_event', ctrl.on_release)
+        fig.canvas.mpl_connect('key_press_event', ctrl.on_press)
+        fig.canvas.mpl_connect('key_release_event', ctrl.on_release)
+        fig.canvas.mpl_connect('close_event', lambda e: setattr(ctrl, "quit", True))  # 창을 닫아도 정상 종료
+        if builder is not None and mapping.save_path:
+            plt.rcParams["keymap.save"] = []  # matplotlib 기본 저장창 단축키(s) 해제
+            fig.canvas.mpl_connect('key_press_event', lambda e: e.key == 's' and save_map())
     else:
         cmd = {"v": 1.0, "yaw_rate": 0.1}  # 키보드를 안 쓰면 기존처럼 원을 그리며 이동
 
     while (kb.enabled and viz.show_animation) or cfg.sim_time >= time:
+        if ctrl is not None and ctrl.quit:
+            break
         time += robot.dt
 
         # 1. 로봇의 현재 입력(속도, 각속도) 가져오기 (키보드: 누르고 있는 키로 가속/복귀 계산)
@@ -397,7 +468,7 @@ def main(config=None):
         u = robot.u
 
         # 2. 실제 로봇 이동 + 관측값 생성 (+ Dead Reckoning 계산)
-        z, ud = robot.observation(u, room.rf_id)
+        z, ud = robot.observation(u, room.rf_id)  # n_rays > 0 이면 내부에서 광선 관측점으로 대체됨
         x_true, x_dr = robot.x_true, robot.x_dr
 
         # 3. 파티클 예측 (노이즈 낀 입력 ud 사용)
@@ -411,6 +482,13 @@ def main(config=None):
         x_est, PEst = robot.pf_localization()
         px = robot.px
 
+        # 6. 이번에 관측한 점들로 지도 갱신 (위치는 실제 위치 또는 필터 추정 위치)
+        #    끝점은 정답 벽 좌표가 아니라 (그 위치 + 측정한 거리/각도) 로 만든 "로봇이 믿는 끝점"
+        map_pose = x_est if mapping.use_estimated_pose else x_true
+        seen = scan_to_world(map_pose, z[:, 0], z[:, 3])  # (n, 2) 로봇이 믿는 끝점의 월드 좌표
+        if builder is not None:
+            builder.update(map_pose, seen)
+
         # 기록 저장
         h_x_est = np.hstack((h_x_est, x_est))
         h_x_dr = np.hstack((h_x_dr, x_dr))
@@ -420,12 +498,16 @@ def main(config=None):
             h_x_est, h_x_dr, h_x_true = h_x_est[:, -n_keep:], h_x_dr[:, -n_keep:], h_x_true[:, -n_keep:]
 
         if viz.show_animation:
+            plt.sca(ax_sim)
             plt.cla()
 
-            room.plot()  # 벽 (회색 사각형) + 레퍼런스 포인트 (검은 별)
-            # 로봇 -> 관측된 레퍼런스 포인트를 잇는 검은 점선
-            for i in range(len(z[:, 0])):
-                plt.plot([x_true[0, 0], z[i, 1]], [x_true[1, 0], z[i, 2]], "--k", linewidth=0.8)
+            ray_mode = robot.n_rays > 0 and hasattr(world, "raycast")
+            room.plot(show_ref=not ray_mode)  # 벽 (회색) + 레퍼런스 포인트 (검은 별). 광선 모드에선 고정 별 대신 지금 보이는 점만 그림
+            if ray_mode:
+                plt.plot(seen[:, 0], seen[:, 1], "*k")  # 로봇이 믿는 끝점 (위치 오차와 거리 노이즈가 반영됨)
+            # 지도에 쓰는 위치 -> 로봇이 믿는 끝점을 잇는 검은 점선
+            for i in range(len(seen)):
+                plt.plot([map_pose[0, 0], seen[i, 0]], [map_pose[1, 0], seen[i, 1]], "--k", linewidth=0.8)
             # 시야각 영역: 로봇이 보는 방향 +- fov/2 부채꼴을 옅은 색으로 칠함
             yaw_deg = math.degrees(x_true[2, 0])
             half_deg = math.degrees(robot.fov) / 2.0
@@ -450,11 +532,35 @@ def main(config=None):
             body = body @ np.array([[c, s], [-s, c]]) + x_true[:2, 0]
             plt.gca().add_patch(Polygon(body, closed=True, facecolor="royalblue", edgecolor="k", zorder=5))
             plot_covariance_ellipse(x_est, PEst)  # 불확실성 타원
-            plt.axis("equal")
+            # 보이는 범위. 왼쪽 지도는 항상 지도 전체.
+            # 오른쪽 시뮬레이션은 view_radius 가 있으면 게임 카메라처럼 로봇을 따라다니는 고정 크기 창만 보여준다
+            # (창은 지도 가장자리 밖으로 나가지 않고, 지도와 같은 가로세로 비율이라 좌우 패널의 모양이 같다)
+            world_lim = (room.x_min, room.x_max, room.y_min, room.y_max)
+            sim_lim = world_lim
+            if viz.view_radius is not None:
+                half_w = viz.view_radius
+                half_h = viz.view_radius * (room.y_max - room.y_min) / (room.x_max - room.x_min)
+                cx = float(np.clip(x_true[0, 0], room.x_min + half_w, room.x_max - half_w)) \
+                    if 2 * half_w < room.x_max - room.x_min else (room.x_min + room.x_max) / 2.0
+                cy = float(np.clip(x_true[1, 0], room.y_min + half_h, room.y_max - half_h)) \
+                    if 2 * half_h < room.y_max - room.y_min else (room.y_min + room.y_max) / 2.0
+                sim_lim = (cx - half_w, cx + half_w, cy - half_h, cy + half_h)
+            for ax, (x_lo, x_hi, y_lo, y_hi) in ((ax_sim, sim_lim), (ax_map, world_lim)):
+                if ax is not None:
+                    ax.set_xlim(x_lo, x_hi)
+                    ax.set_ylim(y_lo, y_hi)
+                    ax.set_aspect("equal", adjustable="box")
             plt.grid(True)
-            plt.title("v=%.1f m/s  yaw_rate=%.1f rad/s   "
-                      "[hold arrows, space: stop, esc: quit]" % (cmd["v"], cmd["yaw_rate"]))
+            plt.title("v=%.1f m/s  yaw_rate=%.1f rad/s\n[hold arrows, space: stop, esc: quit]"
+                      % (cmd["v"], cmd["yaw_rate"]), fontsize=9)
+            if ax_map is not None:  # 왼쪽 지도 갱신
+                map_img.set_data(builder.explored_view())
+                map_true.set_data([x_true[0, 0]], [x_true[1, 0]])
+                map_est.set_data([x_est[0, 0]], [x_est[1, 0]])
             plt.pause(0.001)
+
+    if builder is not None and mapping.save_path:  # 시뮬레이션이 끝나면(esc / 창 닫기 포함) 저장
+        save_map()
 
 
 if __name__ == '__main__':

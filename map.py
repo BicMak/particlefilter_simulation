@@ -70,12 +70,13 @@ class Map:
                 pts[i] = [self.x_min, self.y_max - (si - 2 * w - h)]
         return pts
 
-    def plot(self):  # pragma: no cover
-        """방의 벽을 회색 굵은 선으로 그리고, 레퍼런스 포인트를 검은 별로 그린다"""
+    def plot(self, show_ref=True):  # pragma: no cover
+        """방의 벽을 회색 굵은 선으로 그리고, 레퍼런스 포인트를 검은 별로 그린다 (show_ref=False 면 벽만)"""
         xs = [self.x_min, self.x_max, self.x_max, self.x_min, self.x_min]
         ys = [self.y_min, self.y_min, self.y_max, self.y_max, self.y_min]
         plt.plot(xs, ys, "-", color="gray", linewidth=3)
-        plt.plot(self.rf_id[:, 0], self.rf_id[:, 1], "*k")
+        if show_ref:
+            plt.plot(self.rf_id[:, 0], self.rf_id[:, 1], "*k")
 
 
 class GridMap:
@@ -146,6 +147,35 @@ class GridMap:
         first = np.argmax(hit)  # 처음 벽을 만난 지점
         return dist * (1.0 - t[first]) <= tol
 
+    def raycast(self, x, y, yaw, fov, max_range, n_rays):
+        """
+        (x, y) 에서 yaw 방향 +- fov/2 안을 같은 간격으로 나눈 방향으로 광선 n_rays 개를 한꺼번에 쏴서,
+        각 광선이 처음 만나는 벽 위의 점을 돌려준다. (진짜 라이다처럼 시야각을 왼쪽 끝 -> 오른쪽 끝으로 훑음)
+        미리 뽑아둔 레퍼런스 대신 "로봇이 지금 시야각 안에서 실제로 보는 벽" 을 관측점으로 쓰기 위한 함수.
+        광선이 벽을 못 만나고 지도/최대거리를 벗어나면 그 광선은 버린다.
+          return : (n, 2) 월드 좌표 [x, y]  (각도가 작은 광선부터 순서대로)
+        """
+        limit = min(max_range, math.hypot(self.x_max, self.y_max))  # 거리 제한이 inf 여도 지도 크기까지만
+        step = self.resolution * 0.5  # 벽을 건너뛰지 않도록 한 칸의 절반씩 전진
+        r = np.arange(step, limit, step)  # (R,) 광선 위에서 확인할 거리들
+        # 시야각 안을 균등하게 n_rays 등분 (가장자리가 시야각 밖으로 새지 않게 살짝 안쪽). 1개면 정면만
+        if n_rays == 1:
+            angles = np.array([yaw])
+        else:
+            angles = yaw + np.linspace(-fov / 2.0, fov / 2.0, n_rays) * 0.999  # (A,)
+        # 모든 광선 x 모든 거리의 좌표를 한 번에 계산: (A, R)
+        xs = x + r[None, :] * np.cos(angles)[:, None]
+        ys = y + r[None, :] * np.sin(angles)[:, None]
+        cols = (xs / self.resolution).astype(int)
+        rows = self.height - 1 - (ys / self.resolution).astype(int)
+        inside = (rows >= 0) & (rows < self.height) & (cols >= 0) & (cols < self.width)
+        hit = np.zeros(xs.shape, dtype=bool)
+        hit[inside] = self.grid[rows[inside], cols[inside]]
+        got = hit.any(axis=1)  # 벽을 만난 광선만
+        first = np.argmax(hit, axis=1)  # 광선마다 처음 벽을 만난 지점
+        idx = np.nonzero(got)[0]
+        return np.column_stack((xs[idx, first[idx]], ys[idx, first[idx]])).reshape(-1, 2)
+
     def wall_pixels_world(self):
         """모든 벽 픽셀의 월드 좌표 (N, 2)"""
         rows, cols = np.nonzero(self.grid)
@@ -161,12 +191,13 @@ class GridMap:
         return pts[idx]
 
     # ---------------- 시각화 / 저장 ----------------
-    def plot(self):  # pragma: no cover
-        """벽(회색) + 레퍼런스 포인트(검은 별). particle_filter.Map.plot() 과 동일한 용도"""
+    def plot(self, show_ref=True):  # pragma: no cover
+        """벽(회색) + 레퍼런스 포인트(검은 별, show_ref=False 면 생략). particle_filter.Map.plot() 과 동일한 용도"""
         extent = (self.x_min, self.x_max, self.y_min, self.y_max)
         plt.imshow(np.where(self.grid, 0.5, 1.0), cmap="gray", vmin=0, vmax=1,
                    extent=extent, origin="upper")
-        plt.plot(self.rf_id[:, 0], self.rf_id[:, 1], "*k")
+        if show_ref:
+            plt.plot(self.rf_id[:, 0], self.rf_id[:, 1], "*k")
 
     def save_image(self, path):
         """정리된 맵 이미지 저장 (벽=검정, 빈 공간=흰색, 레퍼런스=빨간 점)"""

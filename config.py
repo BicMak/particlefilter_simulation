@@ -6,7 +6,7 @@ particle_filter.py 에서 쓰는 설정(config) 모음.
 import math
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -18,8 +18,9 @@ class RobotConfig:
     """로봇 + 파티클 필터 파라미터"""
     particle: int = 100  # 파티클 개수
     dt: float = 0.1  # time tick [s]
-    max_range: float = math.inf  # 최대 관측 거리 [m] (inf = 거리 제한 없음, 시야각으로만 결정)
-    fov: float = field(default_factory=lambda: np.deg2rad(60.0))  # 시야각 [rad]: yaw 기준 좌우 fov/2 안쪽만 관측
+    max_range: float = 10 # math.inf  # 최대 관측 거리 [m] (inf = 거리 제한 없음, 시야각으로만 결정)
+    fov: float = field(default_factory=lambda: np.deg2rad(360.0))  # 시야각 [rad]: yaw 기준 좌우 fov/2 안쪽만 관측
+    n_rays: int = 60  # 0: 미리 뽑아둔 레퍼런스 포인트(rf_id)를 관측. 1 이상: 시야각 안의 랜덤한 방향으로 광선을 매 step 이만큼 쏴서 실제로 보이는 벽 위의 점을 관측 (이미지 지도에서만)
     n_threshold_ratio: float = 0.05  # 유효 파티클 수(N_eff)가 particle * 이 비율보다 작으면 리샘플링 (0.5 = 절반)
     v: float = 1.0  # 초기 속도 [m/s]
     yaw_rate: float = 0.1  # 초기 각속도 [rad/s]
@@ -49,8 +50,8 @@ class RoomConfig:
 class ImageMapConfig:
     """손그림 지도 (map.py 의 GridMap)"""
     use_image_map: bool = True  # True: 이미지에서 만든 지도 사용, False: 사각형 방(RoomConfig) 사용
-    image: str = os.path.join(HERE, "input_image", "Untitled.png")  # 손으로 그린 평면도 이미지
-    resolution: float = 0.03  # 이미지 한 픽셀의 실제 길이 [m/px]
+    image: str = os.path.join(HERE, "input_image", "doolhof_03.jpg")  # 평면도/미로 이미지 (벽이 어둡고 배경이 밝은 그림)
+    resolution: float = 0.1  # 이미지 한 픽셀의 실제 길이 [m/px]
     n_ref: int = 200  # 벽 픽셀에서 샘플링할 레퍼런스 포인트 개수
     robot_start: List[float] = field(default_factory=lambda: [15.0, 7.5, 0.0, 0.0])  # 로봇 시작 [x, y, yaw, v]
 
@@ -70,12 +71,24 @@ class KeyboardConfig:
 class VizConfig:
     """화면 표시"""
     show_animation: bool = True
+    figsize: Tuple[float, float] = (7.5, 6.0)  # 창 크기 [inch] (패널 하나 기준: 지도 패널이 같이 뜨면 가로가 2배)
+    view_radius: Optional[float] = 8  # 시뮬레이션(오른쪽) 화면을 로봇 중심 +- 이 반경 [m] 만큼만 보여주고 로봇을 따라다님 (작을수록 확대, 지도 가장자리 밖은 안 보임). None = 지도 전체. 왼쪽 지도는 항상 전체
     trail_time: Optional[float] = 10.0  # 궤적을 남기는 시간 [s]. 이보다 오래된 건 지움 (None = 안 지움)
     robot_size: float = 0.7  # 로봇 삼각형 크기 [m]
     fov_draw_radius: float = 10.0  # 시야각 부채꼴을 그릴 반지름 [m] (그리기 전용, 관측 거리와 무관)
-    particle_draw_ratio: float = 0.2  # 전체 파티클 중 화면에 그릴 비율 (0.05 = 5%, 1.0 = 전부). 매 프레임 랜덤 샘플링
-    min_particles_draw: int = 10  # 비율로 계산한 개수가 이보다 적어도 최소 이만큼은 그림 (파티클이 이보다 적으면 전부)
+    particle_draw_ratio: float = 0.5  # 전체 파티클 중 화면에 그릴 비율 (0.05 = 5%, 1.0 = 전부). 매 프레임 랜덤 샘플링
+    min_particles_draw: int = 5  # 비율로 계산한 개수가 이보다 적어도 최소 이만큼은 그림 (파티클이 이보다 적으면 전부)
     particle_dir_len: float = 0.5  # 파티클 방향선 길이 [m]
+
+
+@dataclass
+class MappingConfig:
+    """탐색하면서 지도 그리기 (lidar_to_grid_map.py 의 MapBuilder). 화면 왼쪽에 로봇이 지금까지 본 곳만 그려짐"""
+    enabled: bool = True
+    resolution: Optional[float] = 0.3  # 탐색 지도의 한 칸 크기 [m/px]. None 이면 원본 지도(image_map)의 해상도를 따름
+    save_path: Optional[str] = "output_image/explored_map.png"  # 시뮬 종료/ s 키 입력 시 격자 지도를 이 이미지로 저장 (None 이면 저장 안 함)
+    use_estimated_pose: bool = False  # False: 실제 위치(x_true)로 그림 = 깨끗한 지도, True: 필터 추정 위치(x_est)로 그림 = 위치 오차가 번진 지도
+    use_flood_fill: bool = False  # True: 광선 사이 빈틈도 부채꼴 안쪽을 flood fill 로 빈 공간 처리 (관측점이 많을수록 잘 맞음). False: 광선이 지나간 칸만
 
 
 @dataclass
@@ -87,4 +100,5 @@ class Config:
     room: RoomConfig = field(default_factory=RoomConfig)
     image_map: ImageMapConfig = field(default_factory=ImageMapConfig)
     keyboard: KeyboardConfig = field(default_factory=KeyboardConfig)
+    mapping: MappingConfig = field(default_factory=MappingConfig)
     viz: VizConfig = field(default_factory=VizConfig)
