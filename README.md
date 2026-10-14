@@ -27,6 +27,8 @@
 ```
 particle_viewer/
 ├── particle_filter.py   # 메인. Robot(파티클 필터 포함), KeyboardController, main()
+├── graphslam.py         # 그래프 SLAM. 랜드마크(번호를 아는 레퍼런스) 관측 + 오도메트리로 키프레임 위치를 한꺼번에 최적화
+├── icpslam.py           # ICP SLAM. 랜드마크 없이 라이다 스캔끼리 맞춰(ICP) 이동량을 재고, 루프를 닫아 그래프로 최적화
 ├── map.py               # 지도 생성. Map(사각형 방), GridMap(평면도 이미지), build_map()
 ├── lidar_to_grid_map.py # 탐색 지도(점유 격자) 작성. MapBuilder
 ├── config.py            # 모든 설정값 (dataclass)
@@ -88,17 +90,18 @@ main(Config(robot=RobotConfig(particle=500), viz=VizConfig(trail_time=None)))
 | `RobotConfig.particle` | 100 | 파티클 개수 |
 | `RobotConfig.fov` | 60° | 시야각. 로봇 진행 방향 기준 좌우 `fov/2`만 관측 |
 | `RobotConfig.max_range` | ∞ | 최대 관측 거리 [m] |
-| `RobotConfig.Q` | σ = 0.5 m | **필터가 믿는** 거리 센서 노이즈. 가중치 계산에 사용 |
-| `RobotConfig.R` | σ = 0.8 m/s, 45°/s | **필터가 믿는** 입력(속도, 각속도) 노이즈. 파티클을 퍼뜨리는 크기 |
-| `SimNoiseConfig.Q` | σ = 0.02 m | 시뮬레이션에서 **실제로** 거리 센서에 섞이는 노이즈 |
-| `SimNoiseConfig.R` | σ = 0.05 m/s, 2°/s | 시뮬레이션에서 **실제로** 입력(엔코더, IMU)에 섞이는 노이즈 |
+| `RobotConfig.sigma_range` | 0.5 m | **필터가 믿는** 거리 센서 노이즈. 가중치 계산에 사용 |
+| `RobotConfig.sigma_v`, `sigma_yaw_rate` | 0.8 m/s, 45°/s | **필터가 믿는** 입력(속도, 각속도) 노이즈. 파티클을 퍼뜨리는 크기 |
+| `SimNoiseConfig.sigma_range` | 0.02 m | 시뮬레이션에서 **실제로** 거리 센서에 섞이는 노이즈 |
+| `SimNoiseConfig.sigma_bearing` | 0.5° | 시뮬레이션에서 **실제로** 랜드마크 각도 관측에 섞이는 노이즈 (그래프 SLAM 전용) |
+| `SimNoiseConfig.sigma_v`, `sigma_yaw_rate` | 0.05 m/s, 2°/s | 시뮬레이션에서 **실제로** 입력(엔코더, IMU)에 섞이는 노이즈 |
 | `ImageMapConfig.use_image_map` | True | True: 이미지 맵, False: 사각형 방(`RoomConfig`) |
 | `ImageMapConfig.resolution` | 0.1 | 이미지 한 픽셀의 실제 길이 [m/px] (지도 크기 = 이미지 픽셀 수 × 이 값) |
 | `ImageMapConfig.robot_start` | `[15, 7.5, 0, 0]` | 로봇 시작 `[x, y, yaw, v]` |
 | `VizConfig.trail_time` | 10초 | 궤적을 남기는 시간 (`None`이면 안 지움) |
 | `VizConfig.particle_draw_ratio` | 0.5 | 전체 파티클 중 화면에 그릴 비율 (그리기 전용) |
 
-`RobotConfig`의 `Q`, `R`(필터의 믿음)과 `SimNoiseConfig`의 `Q`, `R`(실제 오차)은 **일부러 따로** 두었습니다. 필터는 실제 오차 크기를 모르기 때문에, 보통 필터 쪽을 더 크게 잡습니다.
+`RobotConfig`의 `sigma_*`(필터의 믿음)과 `SimNoiseConfig`의 `sigma_*`(실제 오차)는 **일부러 따로** 두었습니다. 필터는 실제 오차 크기를 모르기 때문에, 보통 필터 쪽을 더 크게 잡습니다.
 
 ## 동작 원리
 
@@ -106,8 +109,8 @@ main(Config(robot=RobotConfig(particle=500), viz=VizConfig(trail_time=None)))
 
 1. **입력 결정**: 키보드(또는 고정값)로 지령 `u = [v, yaw_rate]`를 정합니다.
 2. **실제 로봇 이동 + 관측** (`Robot.observation`): 노이즈 없는 `u`로 실제 로봇(`x_true`)이 움직이고, 시야각 안의 레퍼런스까지의 거리에 센서 노이즈를 섞어 관측 `z`(각 행: `[노이즈 낀 거리, 레퍼런스 x, 레퍼런스 y, 빔 각도]`)를 만듭니다. 엔코더/IMU처럼 노이즈가 섞인 입력 `ud`도 함께 만들어지며, `ud`만으로 적분한 것이 Dead Reckoning(`x_dr`)입니다.
-3. **예측** (`predict_particles`): 파티클마다 `ud`에 `R` 크기의 노이즈를 또 섞어서 운동 모델로 이동시킵니다. 이 단계에서 파티클이 퍼집니다.
-4. **가중치 갱신** (`calc_delta` → `update_weights`): 각 파티클에서 레퍼런스까지의 예상 거리와 관측 거리의 차이 `delta`를 구하고, `Q`를 폭으로 하는 가우시안 우도로 가중치를 곱합니다. 우도가 0으로 언더플로우하지 않도록 로그 영역에서 계산합니다.
+3. **예측** (`predict_particles`): 파티클마다 `ud`에 `sigma_v`, `sigma_yaw_rate` 크기의 노이즈를 또 섞어서 운동 모델로 이동시킵니다. 이 단계에서 파티클이 퍼집니다.
+4. **가중치 갱신** (`calc_delta` → `update_weights`): 각 파티클에서 레퍼런스까지의 예상 거리와 관측 거리의 차이 `delta`를 구하고, `sigma_range`를 폭으로 하는 가우시안 우도로 가중치를 곱합니다. 우도가 0으로 언더플로우하지 않도록 로그 영역에서 계산합니다.
 5. **추정 + 리샘플링** (`pf_localization`): 파티클의 가중 평균을 추정 위치로, 가중 공분산을 불확실성으로 계산합니다. 유효 파티클 수가 기준보다 작으면 리샘플링합니다.
 
 상태 벡터는 `[x, y, yaw, v]`이고, 파티클은 `px` (4 × N 배열, 열 하나가 파티클 하나), 가중치는 `pw` (1 × N 배열)로 저장합니다.

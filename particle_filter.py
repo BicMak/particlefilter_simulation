@@ -44,7 +44,7 @@ class Robot:
     def __init__(self, cfg: RobotConfig, sim_noise: SimNoiseConfig, x0=None, world=None):
         """
         설정은 전부 RobotConfig 로 주입한다 (전역 상수 참조 없음).
-          cfg       : RobotConfig (particle, Q, R, dt, max_range, fov, n_threshold_ratio, v, yaw_rate). Q, R = 필터가 믿는 노이즈
+          cfg       : RobotConfig (particle, sigma_*, dt, max_range, fov, n_threshold_ratio, v, yaw_rate). sigma_* = 필터가 믿는 노이즈
           sim_noise : SimNoiseConfig. 시뮬레이션에서 센서 측정값/입력에 실제로 섞이는 노이즈 (필터는 모름)
           x0    : 초기 상태 [x, y, yaw, v] (기본: 원점)
           world : GridMap(map.py). 주면 실제 로봇이 벽을 못 뚫고, 벽에 가린 레퍼런스는 관측 안 됨
@@ -62,11 +62,11 @@ class Robot:
         self.n_rays = cfg.n_rays  # 0 이면 고정 레퍼런스, 1 이상이면 시야각 광선으로 관측점 생성
         self.world = world
 
-        # noise covariance
-        self.Q = np.asarray(cfg.Q)  # [필터] 거리 관측 노이즈의 분산 (update_weights 의 σ)
-        self.R = np.asarray(cfg.R)  # [필터] 입력(v, yaw_rate) 노이즈의 분산 (predict_particles 의 퍼짐)
-        self.Q_sim = np.asarray(sim_noise.Q)  # [시뮬레이션] 실제 거리 센서 노이즈
-        self.R_sim = np.asarray(sim_noise.R)  # [시뮬레이션] 실제 입력(엔코더/IMU) 노이즈
+        # noise (표준편차)
+        self.sigma_range = cfg.sigma_range  # [필터] 거리 관측 노이즈 (update_weights 의 σ)
+        self.sigma_v = cfg.sigma_v  # [필터] 입력 속도 노이즈 (predict_particles 의 퍼짐)
+        self.sigma_yaw_rate = cfg.sigma_yaw_rate  # [필터] 입력 각속도 노이즈 (predict_particles 의 퍼짐)
+        self.sim_noise = sim_noise  # [시뮬레이션] 실제 센서/입력 노이즈 (observation 에서만 씀)
 
         # filter properties
         self.particle = cfg.particle  # 파티클 개수
@@ -86,13 +86,13 @@ class Robot:
     def predict_particles(self, u):
         """
         파티클 필터 예측(Predict) 단계.
-        입력 u에 노이즈(R)를 랜덤하게 섞어서 파티클마다 다르게 이동
+        입력 u에 노이즈(sigma_v, sigma_yaw_rate)를 랜덤하게 섞어서 파티클마다 다르게 이동
         -> 입력의 불확실성을 파티클의 퍼짐으로 표현
         """
         for ip in range(self.particle):
             x = self.px[:, ip:ip + 1]
-            ud1 = u[0, 0] + np.random.randn() * np.sqrt(self.R[0, 0])
-            ud2 = u[1, 0] + np.random.randn() * np.sqrt(self.R[1, 1])
+            ud1 = u[0, 0] + np.random.randn() * self.sigma_v
+            ud2 = u[1, 0] + np.random.randn() * self.sigma_yaw_rate
             ud = np.array([[ud1, ud2]]).T
             self.px[:, ip] = self.motion_model(x, ud)[:, 0]
         return self.px
@@ -123,7 +123,7 @@ class Robot:
         pw.sum() == 0 -> NaN이 된다. 그래서 로그 영역에서 더하고, 최댓값을 빼서 정규화한다.
         (수학적으로는 곱하는 것과 같고, 가장 나은 파티클의 가중치가 항상 1이 되어 0으로 안 죽음)
         """
-        sigma = math.sqrt(self.Q[0, 0])
+        sigma = self.sigma_range
         log_w = np.log(np.maximum(self.pw[0], 1e-300))  # 이전 가중치 (0이면 로그가 -inf라서 바닥값)
         for ip in range(self.particle):
             for i in range(delta.shape[1]):
@@ -172,14 +172,14 @@ class Robot:
                                           rf_id[i, 0], rf_id[i, 1])):
                 # 관측치에도 노이즈가 있다고 가정, 
                 # 즉 Rfid-to-robot 거리 측정 센서가 오차를 갖는다고 가정
-                dn = d + np.random.randn() * np.sqrt(self.Q_sim[0, 0])
+                dn = d + np.random.randn() * self.sim_noise.sigma_range
                 zi = np.array([[dn, rf_id[i, 0], rf_id[i, 1], bearing]])
                 z = np.vstack((z, zi))
 
 
         # 속도와 각속도에 노이즈 추가 (엔코더/IMU 오차 흉내)
-        ud1 = u[0, 0] + np.random.randn() * np.sqrt(self.R_sim[0, 0])
-        ud2 = u[1, 0] + np.random.randn() * np.sqrt(self.R_sim[1, 1])
+        ud1 = u[0, 0] + np.random.randn() * self.sim_noise.sigma_v
+        ud2 = u[1, 0] + np.random.randn() * self.sim_noise.sigma_yaw_rate
         ud = np.array([[ud1, ud2]]).T
 
         # 노이즈 낀 입력으로 Dead Reckoning -> 시간이 갈수록 오차가 누적됨
@@ -404,7 +404,10 @@ def main(config=None):
     time = 0.0
     room, x0, world = build_map(cfg)  # 지도 (벽 + 레퍼런스 포인트) 생성: map.py
     robot = Robot(cfg.robot, cfg.sim_noise, x0=x0, world=world)  # 실제 로봇 + Dead Reckoning
-    builder = MapBuilder.from_map(room, mapping.resolution, mapping.use_flood_fill) if mapping.enabled else None  # 탐색한 정보로 지도 그리기
+    builder = MapBuilder.from_map(  # 탐색한 정보로 지도 그리기
+        room, mapping.resolution, mapping.use_flood_fill,
+        l_free=mapping.l_free, l_occ=mapping.l_occ, l_min=mapping.l_min, l_max=mapping.l_max,
+        occ_thresh=mapping.occ_thresh, free_thresh=mapping.free_thresh) if mapping.enabled else None
 
     def save_map():
         #탐색한 격자 지도를 이미지로 저장 (mapping.save_path)

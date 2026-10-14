@@ -18,22 +18,25 @@ class RobotConfig:
     """로봇 + 파티클 필터 파라미터"""
     particle: int = 100  # 파티클 개수
     dt: float = 0.1  # time tick [s]
-    max_range: float = 10 # math.inf  # 최대 관측 거리 [m] (inf = 거리 제한 없음, 시야각으로만 결정)
+    max_range: float = 20 # math.inf  # 최대 관측 거리 [m] (inf = 거리 제한 없음, 시야각으로만 결정)
     fov: float = field(default_factory=lambda: np.deg2rad(360.0))  # 시야각 [rad]: yaw 기준 좌우 fov/2 안쪽만 관측
     n_rays: int = 60  # 0: 미리 뽑아둔 레퍼런스 포인트(rf_id)를 관측. 1 이상: 시야각 안의 랜덤한 방향으로 광선을 매 step 이만큼 쏴서 실제로 보이는 벽 위의 점을 관측 (이미지 지도에서만)
     n_threshold_ratio: float = 0.05  # 유효 파티클 수(N_eff)가 particle * 이 비율보다 작으면 리샘플링 (0.5 = 절반)
     v: float = 1.0  # 초기 속도 [m/s]
     yaw_rate: float = 0.1  # 초기 각속도 [rad/s]
-    # 필터가 "믿는" 노이즈 (설계 파라미터): 우도 계산(Q)과 파티클 퍼뜨리기(R)에만 쓰임
-    Q: np.ndarray = field(default_factory=lambda: np.diag([0.5]) ** 2)  # 거리 관측 노이즈 분산
-    R: np.ndarray = field(default_factory=lambda: np.diag([0.8, np.deg2rad(45.0)]) ** 2)  # 입력(v, yaw_rate) 노이즈 분산
+    # 필터가 "믿는" 노이즈 표준편차 (설계 파라미터): 우도 계산(sigma_range)과 파티클 퍼뜨리기(sigma_v, sigma_yaw_rate)에만 쓰임
+    sigma_range: float = 0.5  # 거리 관측 [m]
+    sigma_v: float = 0.8  # 입력 속도 [m/s]
+    sigma_yaw_rate: float = math.radians(45.0)  # 입력 각속도 [rad/s]
 
 
 @dataclass
 class SimNoiseConfig:
     """시뮬레이션에서 "실제로" 들어가는 센서 노이즈 (실제 하드웨어라면 센서가 물리적으로 내는 오차). 필터는 이 값을 모른다"""
-    Q: np.ndarray = field(default_factory=lambda: np.diag([0.02]) ** 2)  # 거리 센서 노이즈 분산
-    R: np.ndarray = field(default_factory=lambda: np.diag([0.05, np.deg2rad(2.0)]) ** 2)  # 속도/각속도(엔코더, IMU) 노이즈 분산
+    sigma_range: float = 0.02  # 거리 관측 노이즈 표준편차 [m] (랜드마크 관측 + 지도용 라이다 스캔)
+    sigma_bearing: float = math.radians(0.5)  # 랜드마크 각도 관측 노이즈 표준편차 [rad] (그래프 SLAM 에서만 씀. 파티클 필터는 각도를 안 씀)
+    sigma_v: float = 0.05  # 속도(엔코더) 노이즈 표준편차 [m/s]
+    sigma_yaw_rate: float = math.radians(2.0)  # 각속도(IMU) 노이즈 표준편차 [rad/s]
 
 
 @dataclass
@@ -52,7 +55,7 @@ class ImageMapConfig:
     use_image_map: bool = True  # True: 이미지에서 만든 지도 사용, False: 사각형 방(RoomConfig) 사용
     image: str = os.path.join(HERE, "input_image", "doolhof_03.jpg")  # 평면도/미로 이미지 (벽이 어둡고 배경이 밝은 그림)
     resolution: float = 0.1  # 이미지 한 픽셀의 실제 길이 [m/px]
-    n_ref: int = 200  # 벽 픽셀에서 샘플링할 레퍼런스 포인트 개수
+    n_ref: int = 500  # 벽 픽셀에서 샘플링할 레퍼런스 포인트 개수
     robot_start: List[float] = field(default_factory=lambda: [15.0, 7.5, 0.0, 0.0])  # 로봇 시작 [x, y, yaw, v]
 
 
@@ -82,6 +85,70 @@ class VizConfig:
 
 
 @dataclass
+class GraphSlamConfig:
+    """그래프 SLAM (graphslam.py). 고정 레퍼런스(랜드마크)를 번호로 알아보고, 키프레임 위치들을 한꺼번에 최적화"""
+    keyframe_dt: float = 0.1  # 이 시간[s]마다 키프레임(그래프 노드) 하나를 추가
+    optimize_every: float = 15.0  # 이 시간[s]마다 그래프 전체를 다시 최적화
+    max_iter: int = 1  # Gauss-Newton 최대 반복 횟수
+    
+    # 그래프가 "믿는" 노이즈 (엣지 가중치 = 이 분산의 역수)
+    sigma_range: float = 0.01  # 랜드마크 거리 관측 [m]
+    sigma_bearing: float = math.radians(0.5)  # 랜드마크 각도 관측 [rad]
+    odo_sigma_xy: float = 0.01  # 키프레임 사이 오도메트리 이동량 (x, y) [m]
+    odo_sigma_yaw: float = math.radians(0.5)  # 키프레임 사이 오도메트리 회전량 [rad]
+    
+    n_scan_rays: int = 120  # 지도용 라이다 광선 수 (최적화된 위치로 지도를 다시 그릴 때 사용)
+    draw_every: int = 3  # 화면을 이 step 마다 한 번만 그림 (그리기가 계산보다 훨씬 느려서. 1 = 매 step)
+    
+    # 체크포인트 따라가기 (키보드 대신). 화면을 왼쪽 클릭하면 체크포인트 추가, 오른쪽 클릭하면 전부 지움
+    waypoints: List[List[float]] = field(default_factory=list)  # 미리 정해 둘 체크포인트 [[x, y], ...] [m]
+    goal_tolerance: float = 0.4  # 체크포인트에 이 거리[m] 안으로 들어오면 도착으로 보고 다음으로
+    v_max: float = 1.5  # 최대 속도 [m/s]
+    yaw_rate_max: float = 1.5  # 최대 각속도 [rad/s]
+    k_v: float = 1.0  # 속도 = k_v * 남은 거리 (v_max 로 자름)
+    k_w: float = 2.5  # 각속도 = k_w * 방향 오차 (yaw_rate_max 로 자름)
+    stuck_time: float = 0.5  # 앞으로 가라고 했는데 이 시간[s] 동안 벽에 막혀 못 움직이면 그 체크포인트는 도착한 것으로 처리
+
+
+@dataclass
+class IcpSlamConfig:
+    """ICP SLAM (icpslam.py). 랜드마크 없이 라이다 스캔만 쓴다. 이웃한 키프레임의 스캔을 ICP 로 맞춰 이동량을 재고,
+    예전에 지나간 곳에 다시 오면(루프) 그 스캔과도 맞춰서, 키프레임 위치 전체를 그래프로 한꺼번에 최적화"""
+    keyframe_dt: float = 1  # 이 시간[s]마다 키프레임(스캔 + 그래프 노드) 하나를 추가
+    optimize_every: float = 3.0  # 이 시간[s]마다 그래프 전체를 다시 최적화
+    max_iter: int = 10  # Gauss-Newton 최대 반복 횟수
+    n_scan_rays: int = 120  # 라이다 광선 수 (ICP 와 지도 둘 다 이 스캔을 씀)
+    
+    # ICP (scan matching)
+    icp_max_iter: int = 30  # ICP 최대 반복 횟수
+    icp_max_corr_dist: float =  0.5 # 가장 가까운 점이 이 거리[m]보다 멀면 대응점으로 안 씀 (겹치지 않는 부분을 버림)
+    icp_tol: float = 1e-6  # 한 반복에서 이동량 변화가 이보다 작으면 수렴
+    icp_min_inliers: int = 50  # 대응점이 이보다 적으면 실패로 보고 오도메트리를 씀
+    icp_max_err: float = 0.1  # 수렴 후 대응점 평균 거리[m]가 이보다 크면 실패
+    
+    # 루프 닫기: 지금 추정 위치가 예전 키프레임과 가까우면 그 스캔과도 ICP 로 맞춰서 엣지를 추가
+    loop_dist: float = 3.0  # 이 거리[m] 안의 예전 키프레임을 후보로
+    loop_min_gap: int = 5  # 키프레임 번호 차이가 이보다 작으면 "예전"이 아니라고 봄 (바로 옆은 이미 이웃 엣지가 있음)
+    loop_max_err: float = 0.2  # 루프 ICP 는 초기값이 나쁠 수 있어서 더 엄격하게 (잘못 닫으면 지도가 망가짐)
+    
+    # 그래프가 "믿는" 노이즈 (엣지 가중치 = 이 분산의 역수)
+    icp_sigma_xy: float = 0.03  # ICP 로 잰 이동량 (x, y) [m]
+    icp_sigma_yaw: float = math.radians(1.0)  # ICP 로 잰 회전량 [rad]
+    odo_sigma_xy: float = 0.1  # ICP 실패 시 대신 쓰는 오도메트리 이동량 [m]
+    odo_sigma_yaw: float = math.radians(5.0)  # 오도메트리 회전량 [rad]
+    draw_every: int = 3  # 화면을 이 step 마다 한 번만 그림
+    
+    # 체크포인트 따라가기 (GraphSlamConfig 와 같음. 화면 왼쪽 클릭 = 추가, 오른쪽 클릭 = 전부 지움)
+    waypoints: List[List[float]] = field(default_factory=list)
+    goal_tolerance: float = 0.4
+    v_max: float = 1.5
+    yaw_rate_max: float = 1.5
+    k_v: float = 1.0
+    k_w: float = 2.5
+    stuck_time: float = 0.5
+
+
+@dataclass
 class MappingConfig:
     """탐색하면서 지도 그리기 (lidar_to_grid_map.py 의 MapBuilder). 화면 왼쪽에 로봇이 지금까지 본 곳만 그려짐"""
     enabled: bool = True
@@ -89,6 +156,12 @@ class MappingConfig:
     save_path: Optional[str] = "output_image/explored_map.png"  # 시뮬 종료/ s 키 입력 시 격자 지도를 이 이미지로 저장 (None 이면 저장 안 함)
     use_estimated_pose: bool = False  # False: 실제 위치(x_true)로 그림 = 깨끗한 지도, True: 필터 추정 위치(x_est)로 그림 = 위치 오차가 번진 지도
     use_flood_fill: bool = False  # True: 광선 사이 빈틈도 부채꼴 안쪽을 flood fill 로 빈 공간 처리 (관측점이 많을수록 잘 맞음). False: 광선이 지나간 칸만
+    l_free: float = -0.2  # 광선이 지나간 칸이 받는 log-odds 변화량 (음수 = 빈 공간 쪽. 클수록 빨리 "빈 칸"이 됨)
+    l_occ: float = 0.4  # 끝점 칸이 받는 log-odds 변화량 (양수 = 장애물 쪽. 클수록 빨리 "막힌 칸"이 됨)
+    l_min: float = -6.0  # log-odds 하한 (너무 확신하면 나중에 고치기 힘들어서 제한)
+    l_max: float = 6.0  # log-odds 상한
+    occ_thresh: float = 0.7  # 점유 확률이 이 값을 넘으면 "막힌 칸"
+    free_thresh: float = 0.3  # 점유 확률이 이 값 미만이면 "빈 칸" (두 값 사이는 "모름")
 
 
 @dataclass
@@ -102,3 +175,5 @@ class Config:
     keyboard: KeyboardConfig = field(default_factory=KeyboardConfig)
     mapping: MappingConfig = field(default_factory=MappingConfig)
     viz: VizConfig = field(default_factory=VizConfig)
+    graphslam: GraphSlamConfig = field(default_factory=GraphSlamConfig)
+    icpslam: IcpSlamConfig = field(default_factory=IcpSlamConfig)

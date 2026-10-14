@@ -20,6 +20,7 @@ author: Erno Horvath, Csaba Hajdu based on Atsushi Sakai's scripts
 import math
 from collections import deque
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -234,11 +235,12 @@ class MapBuilder:
         explored: shape (height, width) 의 bool 배열. 한 번이라도 관측된 칸이면 True.
             log_odds 가 0 근처인 칸이 "관측했지만 증거가 상쇄된 칸"인지 "한 번도 못 본 칸"인지 구분하는 데 쓴다.
         use_flood_fill: True 면 update 에서 부채꼴 안쪽도 flood fill 로 빈 공간 처리.
+        L_FREE, L_OCC: 관측 한 번당 log-odds 변화량 (지나간 칸 / 끝점 칸).
+        L_MIN, L_MAX: log-odds 범위.
+        OCC_THRESH, FREE_THRESH: 점유 확률이 OCC 초과면 "막힌 칸", FREE 미만이면 "빈 칸", 그 사이는 "모름".
     """
-    L_FREE, L_OCC = -0.85, 0.4  # 관측 한 번당 log-odds 변화량
-    L_MIN, L_MAX = -4.0, 4.0  # log-odds 범위 (너무 확신하면 나중에 고치기 힘들어서 제한)
-
-    def __init__(self, x_min, x_max, y_min, y_max, resolution=0.3, use_flood_fill=False):
+    def __init__(self, x_min, x_max, y_min, y_max, resolution=0.3, use_flood_fill=False,
+                 l_free=-0.85, l_occ=0.4, l_min=-4.0, l_max=4.0, occ_thresh=0.6, free_thresh=0.4):
         """모든 칸이 "모름"인 빈 지도를 만든다.
 
         Args:
@@ -248,11 +250,20 @@ class MapBuilder:
             y_max: 지도의 위쪽 끝 월드 y [m].
             resolution: 한 칸의 한 변 길이 [m/px].
             use_flood_fill: True 면 update 에서 광선 사이 빈틈도 flood fill 로 빈 공간 처리한다.
+            l_free: 광선이 지나간 칸이 받는 log-odds 변화량 (음수 = 빈 공간 쪽).
+            l_occ: 끝점 칸이 받는 log-odds 변화량 (양수 = 장애물 쪽).
+            l_min: log-odds 하한. 너무 확신하면 나중에 고치기 힘들어서 제한한다.
+            l_max: log-odds 상한.
+            occ_thresh: 점유 확률이 이 값을 넘으면 "막힌 칸".
+            free_thresh: 점유 확률이 이 값 미만이면 "빈 칸". 두 값 사이는 "모름".
         """
         self.x_min, self.x_max = x_min, x_max
         self.y_min, self.y_max = y_min, y_max
         self.resolution = resolution
         self.use_flood_fill = use_flood_fill  # True: 광선 사이 빈틈도 flood fill 로 빈 공간 처리 (update 참고)
+        self.L_FREE, self.L_OCC = l_free, l_occ  # 관측 한 번당 log-odds 변화량
+        self.L_MIN, self.L_MAX = l_min, l_max  # log-odds 범위
+        self.OCC_THRESH, self.FREE_THRESH = occ_thresh, free_thresh  # "막힌 칸" / "빈 칸" 을 가르는 확률
 
         # 칸 개수 = 범위 길이 / 한 칸 크기 (나머지가 남으면 올림해서 지도 끝이 잘리지 않게)
         self.height = int(math.ceil((y_max - y_min) / resolution))
@@ -264,19 +275,20 @@ class MapBuilder:
 
 
     @classmethod
-    def from_map(cls, world, resolution=None, use_flood_fill=False):
+    def from_map(cls, world, resolution=None, use_flood_fill=False, **params):
         """기존 지도(GridMap / Map)와 같은 범위로 빈 지도를 만든다.
 
         Args:
             world: x_min, x_max, y_min, y_max 속성을 가진 지도 객체.
             resolution: 한 칸의 한 변 길이 [m/px]. None 이면 world.resolution, 그것도 없으면 0.03.
             use_flood_fill: __init__ 의 use_flood_fill 과 같다.
+            **params: l_free, l_occ, l_min, l_max, occ_thresh, free_thresh (__init__ 참고).
 
         Returns:
             MapBuilder: 모든 칸이 "모름"인 새 지도.
         """
         res = resolution if resolution is not None else getattr(world, "resolution", 0.03)
-        return cls(world.x_min, world.x_max, world.y_min, world.y_max, res, use_flood_fill)
+        return cls(world.x_min, world.x_max, world.y_min, world.y_max, res, use_flood_fill, **params)
 
     @property
     def extent(self):
@@ -407,15 +419,14 @@ class MapBuilder:
         np.clip(self.log_odds, self.L_MIN, self.L_MAX, out=self.log_odds)
 
     def _fan_free_mask(self, r0, c0, ends):
-        """로봇과 관측점들이 이루는 부채꼴 안쪽과 각 광선이 지나간 칸을 빈 칸으로 표시한 마스크를 만든다.
+        """로봇과 관측점들이 이루는 부채꼴 다각형 안쪽을 빈 칸으로 표시한 마스크를 만든다.
 
         순서는 다음과 같다.
-          1) 관측점을 각도 순으로 정렬한 뒤 로봇 -> 첫 점 -> ... -> 마지막 점 -> 로봇 순으로
-             이어 닫힌 윤곽선을 그린다.
-          2) 윤곽선 "바깥"을 flood fill 로 채운다. 로봇이 윤곽선 위에 있어서 안쪽에서는
-             시작할 수 없기 때문이다.
-          3) 바깥도 윤곽선도 아닌 칸이 안쪽이다. 윤곽선(벽이 이어졌다고 가정한 선)은
-             빈 칸으로 치지 않는다.
+          1) 관측점을 각도 순으로 정렬한다.
+          2) 로봇 -> 첫 점 -> ... -> 마지막 점 -> 로봇 순서의 다각형을 경계 칸까지 포함해서 채운다.
+             (로봇에서 양 끝 점으로 가는 변과 로봇 칸도 같이 채워진다)
+          3) 점들끼리 이은 선(벽이 이어졌다고 가정한 선)과 끝점 칸은 다시 비운다.
+             벽일 수 있어서 빈 칸으로 치지 않고, 끝점은 update 에서 막힌 칸 증거를 따로 받는다.
 
         Args:
             r0: 로봇 칸의 행 번호.
@@ -434,25 +445,12 @@ class MapBuilder:
         rel = np.arctan2(np.sin(ang - mean), np.cos(ang - mean))
         ends = ends[np.argsort(rel)]
 
-        # 부채꼴을 감싸는 작은 영역에서만 작업 (한 칸씩 여유를 줘서 모서리 (0, 0) 이 항상 바깥이 되게)
-        r_lo, r_hi = min(r0, ends[:, 0].min()), max(r0, ends[:, 0].max())
-        c_lo, c_hi = min(c0, ends[:, 1].min()), max(c0, ends[:, 1].max())
-        off = np.array([r_lo - 1, c_lo - 1])
-        local = np.full((r_hi - r_lo + 3, c_hi - c_lo + 3), 0.5)  # 0.5 = 아직 안 채움
-
-        # 윤곽선 그리기
-        loop = np.vstack(([r0, c0], ends, [r0, c0])) - off  # 닫힌 윤곽선의 꼭짓점들
-        for a, b in zip(loop[:-1], loop[1:]):
-            line = bresenham(tuple(int(v) for v in a), tuple(int(v) for v in b))
-            local[line[:, 0], line[:, 1]] = 1.0  # 윤곽선 = 1.0 (flood fill 이 넘지 못함)
-        flood_fill((0, 0), local)  # 바깥을 0.0 으로 채움
-
-        mask = np.zeros(self.log_odds.shape, dtype=bool)
-        inner = np.argwhere(local == 0.5) + off  # 끝까지 안 채워진 칸 = 윤곽선 안쪽
-        mask[inner[:, 0], inner[:, 1]] = True
-        for r1, c1 in ends:  # 로봇 -> 관측점 직선이 지나간 칸 (끝점 제외)도 빈 칸
-            free = bresenham((r0, c0), (int(r1), int(c1)))[:-1]
-            mask[free[:, 0], free[:, 1]] = True
+        canvas = np.zeros(self.log_odds.shape, dtype=np.uint8)
+        poly = np.vstack(([r0, c0], ends))  # 꼭짓점: 로봇, 첫 점, ..., 마지막 점
+        cv2.fillPoly(canvas, [poly[:, ::-1].astype(np.int32)], 1)  # OpenCV 는 (x=열, y=행) 순서
+        cv2.polylines(canvas, [ends[:, ::-1].astype(np.int32)], False, 0)  # 점들끼리 이은 선은 다시 비움
+        mask = canvas.astype(bool)
+        mask[ends[:, 0], ends[:, 1]] = False  # 끝점 칸은 빈 칸이 아님
         return mask
 
     @property
@@ -463,8 +461,6 @@ class MapBuilder:
             np.ndarray: shape (H, W) 의 확률. 0.5 = 모름, 1 에 가까울수록 장애물.
         """
         return 1.0 - 1.0 / (1.0 + np.exp(self.log_odds))
-
-    OCC_THRESH, FREE_THRESH = 0.6, 0.4  # 확률이 OCC 초과면 "막힌 칸", FREE 미만이면 "빈 칸", 그 사이는 "모름"
 
     def explored_view(self):
         """관측으로 알게 된 칸만 값을 갖고, 모르는 칸은 가려진(masked) 배열을 만든다.
@@ -495,7 +491,7 @@ class MapBuilder:
 
         Returns:
             MapBuilder: 저장 당시의 범위, 해상도, log-odds, 탐험 여부를 가진 지도.
-                use_flood_fill 는 저장하지 않으므로 기본값(False)이 된다.
+                use_flood_fill 와 log-odds 변화량, 임곗값은 저장하지 않으므로 기본값이 된다.
                 explored 가 없는 예전 파일이면 log_odds 가 0 이 아닌 칸을 탐험한 칸으로 본다.
         """
         f = np.load(path)
