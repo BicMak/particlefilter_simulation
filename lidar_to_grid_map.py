@@ -501,3 +501,41 @@ class MapBuilder:
         return mb
 
 
+def grid_match(builder, world, tol):
+    """점유 격자 지도에서 정해진 칸(빈 칸 / 막힌 칸) 중 실제 지도와 맞는 칸의 비율.
+
+      빈 칸   (점유 확률 < FREE_THRESH) : 칸 중심이 실제 지도에서도 빈 공간(바닥)이면 맞음
+      막힌 칸 (점유 확률 > OCC_THRESH)  : 칸 중심이 실제 벽 경계선(world.distance_to_boundary)에서 tol 안이면 맞음
+          라이다는 벽 표면을 맞혀서, 위치가 완벽해도 막힌 칸이 경계선 바로 앞(바닥 쪽) 칸에 찍히기도 한다.
+          그래서 "벽 픽셀 안인가" 가 아니라 "경계선에 붙어 있나" 로 본다.
+    아직 모르는 칸(그 사이 확률)은 세지 않는다.
+    빈 칸이 막힌 칸보다 훨씬 많아서 전체 비율은 빈 칸 쪽으로 끌려간다 (벽이 틀려도 전체는 높게 나옴).
+    그래서 칸 종류별 비율도 같이 낸다.
+
+    Args:
+        builder: 평가할 MapBuilder.
+        world: 실제 지도 (map.GridMap). is_wall, distance_to_boundary 를 쓴다.
+        tol: 막힌 칸이 맞았다고 보는 경계선까지 거리 [m].
+
+    Returns:
+        dict: all / free / wall = 맞는 칸 비율 (0~1, 칸이 없으면 nan), wrong = 안 맞는 칸 (H, W) bool (그리기용).
+    """
+    occ = builder.occupancy
+    free, wall = occ < builder.FREE_THRESH, occ > builder.OCC_THRESH
+    wrong = np.zeros(occ.shape, dtype=bool)
+    ok = {}
+    for name, mask in (("free", free), ("wall", wall)):
+        rows, cols = np.nonzero(mask)
+        centers = np.column_stack((builder.x_min + (cols + 0.5) * builder.resolution,
+                                   builder.y_min + (builder.height - 1 - rows + 0.5) * builder.resolution))
+        if name == "free":
+            good = ~world.is_wall(centers)
+        else:
+            good = np.abs(world.distance_to_boundary(centers)) <= tol
+        wrong[rows[~good], cols[~good]] = True
+        ok[name] = good
+    def rate(good):
+        return float(np.mean(good)) if len(good) else math.nan
+
+    return {"all": rate(np.concatenate((ok["free"], ok["wall"]))), "free": rate(ok["free"]), "wall": rate(ok["wall"]),
+            "wrong": wrong}

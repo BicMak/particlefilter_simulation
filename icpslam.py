@@ -32,18 +32,17 @@ graphslam.py 와 같은 구조(키프레임 그래프 + Gauss-Newton)인데, 랜
 import dataclasses
 import math
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Polygon
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
 from config import Config
-from graphslam import (build_grid, compose, follow_view, go_to_goal, lidar_scan, mean_error, pi_2_pi,
-                       relative_pose, robot_triangle)
+from graphslam import (MapEval, build_grid, compose, draw_map_panels, follow_view, go_to_goal, lidar_scan,
+                       make_window, map_titles, pi_2_pi, relative_pose, robot_triangle)
 from map import build_map
-from particle_filter import Robot, draw_map
+from particle_filter import Robot
+from utils import cv_viewer as cvv
 
 
 def scan_points(ranges, bearings):
@@ -217,34 +216,22 @@ def main(config=None):
     n_icp_fail = 0
     builder = None
 
-    time, next_kf, next_opt = 0.0, 0.0, ic.optimize_every
+    time, next_opt = 0.0, ic.optimize_every
     cmd = {"v": 0.0, "yaw_rate": 0.0}
     waypoints = [list(map(float, w)) for w in ic.waypoints]
-    state = {"quit": False}
     stuck_steps = 0
 
-    fig = ax_map = ax_sim = None
+    win = panels = map_eval = None
     map_dirty = False
-    map_robot = None
-    sim = None
     step_count = 0
     if viz.show_animation:
-        fig, (ax_map, ax_sim) = plt.subplots(1, 2, figsize=(2 * viz.figsize[0], viz.figsize[1]),
-                                             gridspec_kw={"wspace": 0.3})
+        map_eval = MapEval(room, mapping, world) if viz.show_map_eval else None
+        win, panels = make_window("ICP SLAM", room, viz, map_eval, waypoints)  # graphslam.py 와 같은 화면
+        walls = cvv.wall_image(room)
+        map_img = np.full((1, 1, 3), 255, np.uint8)
+        frame_time = robot.dt * ic.draw_every / viz.sim_speed if viz.sim_speed else 0.0
 
-        def on_click(event):
-            if event.inaxes not in (ax_sim, ax_map) or event.xdata is None:
-                return
-            if event.button == 1:
-                waypoints.append([event.xdata, event.ydata])
-            elif event.button == 3:
-                waypoints.clear()
-
-        fig.canvas.mpl_connect('button_press_event', on_click)
-        fig.canvas.mpl_connect('key_press_event', lambda e: e.key == 'escape' and state.update(quit=True))
-        fig.canvas.mpl_connect('close_event', lambda e: state.update(quit=True))
-
-    while (viz.show_animation or cfg.sim_time >= time) and not state["quit"]:
+    while (viz.show_animation or cfg.sim_time >= time) and not (win is not None and win.closed):
         time += robot.dt
 
         # 1. 체크포인트로 가는 입력 -> 이동. 관측(z)은 안 쓰고 x_true / x_dr 갱신만 필요하다
@@ -268,9 +255,14 @@ def main(config=None):
         h_true.append(x_true)
         h_dr.append(x_dr)
 
-        # 2. 키프레임 추가: 스캔을 찍고, 이전 키프레임과 ICP 로 맞춰 이웃 엣지, 예전 키프레임과 맞으면 루프 엣지
-        if time >= next_kf:
-            next_kf += ic.keyframe_dt
+        # 2. 키프레임 추가: 마지막 키프레임에서 오도메트리로 keyframe_dist 만큼 움직였거나 keyframe_angle 만큼 돌았으면
+        #    스캔을 찍고, 이전 키프레임과 ICP 로 맞춰 이웃 엣지, 예전 키프레임과 맞으면 루프 엣지
+        if kf_dr:
+            moved = relative_pose(kf_dr[-1], x_dr)
+            new_kf = math.hypot(moved[0], moved[1]) >= ic.keyframe_dist or abs(moved[2]) >= ic.keyframe_angle
+        else:
+            new_kf = True  # 첫 키프레임은 바로
+        if new_kf:
             ranges, bearings = lidar_scan(world, x_true, robot, ic.n_scan_rays, range_sigma)
             cloud = scan_points(ranges, bearings)
             if not kf_dr:
@@ -291,11 +283,13 @@ def main(config=None):
                     guess = relative_pose(graph.poses[i], graph.poses[k])
                     ok, (rel, err, n_in) = icp(cloud, clouds[i], guess, ic)
                     if ok and err <= ic.loop_max_err:
-                        graph.add_edge(i, k, rel, ic.icp_sigma_xy, ic.icp_sigma_yaw, loop=True)
+                        graph.add_edge(i, k, rel, ic.loop_sigma_xy, ic.loop_sigma_yaw, loop=True)
             scans.append((ranges, bearings))
             clouds.append(cloud)
             kf_true.append(x_true)
             kf_dr.append(x_dr)
+            if map_eval is not None:
+                map_eval.add_scan(x_true, x_dr, ranges, bearings)
 
         # 3. 그래프 최적화 -> 최적화된 위치로 지도를 다시 그림
         if time >= next_opt:
@@ -304,81 +298,56 @@ def main(config=None):
             builder = build_grid(room, mapping, graph.poses, scans)
             map_dirty = True
             n_loop = sum(1 for e in graph.edges if e[4])
-            print("t=%.1fs  nodes=%d  edges=%d (loop %d, icp fail %d)  iter=%d  cost=%.1f  "
-                  "mean error: DR %.2f m -> ICP SLAM %.2f m"
-                  % (time, len(graph.poses), len(graph.edges), n_loop, n_icp_fail, itr, cost,
-                     mean_error(np.array(kf_dr), np.array(kf_true)), mean_error(graph.poses, np.array(kf_true))))
+            print("t=%.1fs  nodes=%d  edges=%d (loop %d, icp fail %d)  iter=%d  cost=%.1f"
+                  % (time, len(graph.poses), len(graph.edges), n_loop, n_icp_fail, itr, cost))
+            if map_eval is not None:
+                map_eval.evaluate(builder, graph.poses, scans)
+                print("  endpoints: " + "   ".join(map_eval.endpoint_text("ICP SLAM").split("\n")[:2]))  # 세 번째 줄(bias 설명)은 화면에만
+                print("  grid map:  " + map_eval.grid_text("ICP SLAM").replace("\n", "   "))
 
-        # 4. 그리기
+        # 4. 그리기 (graphslam.py 와 같은 cv2 화면)
         step_count += 1
-        if viz.show_animation and (step_count % ic.draw_every == 0 or map_dirty):
+        if win is not None and (step_count % ic.draw_every == 0 or map_dirty):
+            if map_dirty:
+                map_dirty = False
+                map_img = cvv.occupancy_image(builder)
             ht, hd, kp = np.array(h_true), np.array(h_dr), graph.poses
-
-            if sim is None:
-                plt.sca(ax_sim)
-                room.plot(show_ref=False)  # 벽만 (랜드마크는 안 씀)
-                sim = {
-                    "scan": ax_sim.plot([], [], ".", color="m", ms=3, label="lidar scan (last keyframe)")[0],
-                    "true": ax_sim.plot([], [], "--b", linewidth=2.0, label="true")[0],
-                    "dr": ax_sim.plot([], [], "-k", linewidth=1.0, label="dead reckoning")[0],
-                    "graph": ax_sim.plot([], [], ".-r", label="ICP SLAM (keyframes)")[0],
-                    "loops": ax_sim.plot([], [], "-", color="limegreen", linewidth=1.5, label="loop closure")[0],
-                    "loop_nodes": ax_sim.plot([], [], "o", color="limegreen", mec="darkgreen", ms=5, zorder=4,
-                                              label="keyframe in a closed loop")[0],  # 루프로 닫힌 구간의 키프레임
-                    "route": ax_sim.plot([], [], ":", color="darkorange", linewidth=1.5)[0],
-                    "goals": ax_sim.plot([], [], "X", color="darkorange", ms=9, label="checkpoints")[0],
-                    "robot": ax_sim.add_patch(Polygon(np.zeros((3, 2)), closed=True, facecolor="royalblue",
-                                                      edgecolor="k", zorder=5)),
-                }
-                ax_sim.set_aspect("equal", adjustable="box")
-                ax_sim.grid(True)
-                ax_sim.legend(loc="upper right", fontsize=8)
-            if clouds:
-                pts = transform_points(clouds[-1], kf_true[-1])  # 마지막 스캔을 찍었을 때의 실제 위치에 그림
-                sim["scan"].set_data(pts[:, 0], pts[:, 1])
-            # 루프 엣지: 선분 사이를 NaN 으로 끊어서 선 객체 하나로
+            wp = np.array(waypoints).reshape(-1, 2)
             loops = [(i, j) for i, j, _, _, lp in graph.edges if lp]
-            seg = np.full((3 * len(loops), 2), np.nan)
-            for n, (i, j) in enumerate(loops):
-                seg[3 * n], seg[3 * n + 1] = kp[i, :2], kp[j, :2]
-            sim["loops"].set_data(seg[:, 0], seg[:, 1])
             # 루프로 닫힌 구간의 키프레임: 루프 엣지 i <-> j 가 생기면 i ~ j 사이 노드가 전부 닫힌 고리가 됨 (땅따먹기처럼)
             #   최적화 때 누적 오차를 나눠 갖는 게 이 구간 전체라서, 양 끝만이 아니라 구간을 통째로 초록 점으로 덮어 그림
             in_loop = np.zeros(len(kp), dtype=bool)
             for i, j in loops:
                 in_loop[min(i, j):max(i, j) + 1] = True
             loop_ids = np.flatnonzero(in_loop)
-            sim["loop_nodes"].set_data(kp[loop_ids, 0], kp[loop_ids, 1])
-            sim["true"].set_data(ht[:, 0], ht[:, 1])
-            sim["dr"].set_data(hd[:, 0], hd[:, 1])
-            sim["graph"].set_data(kp[:, 0], kp[:, 1])
-            wp = np.array(waypoints).reshape(-1, 2)
-            sim["goals"].set_data(wp[:, 0], wp[:, 1])
-            route = np.vstack((x_true[:2], wp))
-            sim["route"].set_data(route[:, 0], route[:, 1])
-            sim["robot"].set_xy(robot_triangle(x_true, viz.robot_size))
-            x_lo, x_hi, y_lo, y_hi = follow_view(room, x_true[0], x_true[1], viz.view_radius)
-            ax_sim.set_xlim(x_lo, x_hi)
-            ax_sim.set_ylim(y_lo, y_hi)
-            ax_sim.set_title("v=%.1f m/s  yaw_rate=%.1f rad/s  t=%.1fs  keyframes=%d  loops=%d\n"
-                             "[left click: add checkpoint, right click: clear, esc: quit]"
-                             % (cmd["v"], cmd["yaw_rate"], time, len(kp), len(loops)), fontsize=9)
 
-            if map_dirty or map_robot is None:
-                map_dirty = False
-                ax_map.cla()
-                if builder is not None:
-                    draw_map(ax_map, builder, max_grid_cells=0)
-                ax_map.plot(kp[:, 0], kp[:, 1], ".-r", ms=3)
-                ax_map.plot(kp[loop_ids, 0], kp[loop_ids, 1], "o", color="limegreen", mec="darkgreen", ms=4)
-                map_robot, = ax_map.plot([], [], "o", color="royalblue", ms=6)
-                ax_map.set_xlim(room.x_min, room.x_max)
-                ax_map.set_ylim(room.y_min, room.y_max)
-                ax_map.set_aspect("equal", adjustable="box")
-                ax_map.set_title("grid map rebuilt from ICP SLAM poses\n(updated every %.0fs)"
-                                 % ic.optimize_every, fontsize=9)
-            map_robot.set_data([x_true[0]], [x_true[1]])
-            plt.pause(0.001)
+            # 시뮬레이션 (로봇을 따라다니는 화면)
+            sim = panels["sim"]
+            sim.view = follow_view(room, x_true[0], x_true[1], viz.view_radius)
+            sim.paint(*walls)  # 벽만 (랜드마크는 안 씀)
+            if clouds:
+                sim.dots(transform_points(clouds[-1], kf_true[-1]), cvv.MAGENTA, 1)  # 마지막 스캔 (찍었을 때의 실제 위치에)
+            sim.polyline(hd[:, :2], cvv.BLACK)  # Dead Reckoning 궤적
+            sim.polyline(ht[:, :2], cvv.BLUE, 2)  # 실제 궤적
+            sim.polyline(kp[:, :2], cvv.RED)  # 최적화된 키프레임
+            sim.dots(kp[:, :2], cvv.RED, 2)
+            if loops:
+                sim.segments(kp[[i for i, _ in loops], :2], kp[[j for _, j in loops], :2], cvv.GREEN, 2)  # 루프 엣지
+            sim.dots(kp[loop_ids, :2], cvv.GREEN, 4, edge=cvv.DARK_GREEN)
+            sim.polyline(np.vstack((x_true[:2], wp)), cvv.ORANGE)  # 로봇 -> 남은 체크포인트
+            sim.markers(wp, cvv.ORANGE, kind="x", size=11, thickness=2)
+            sim.polygon(robot_triangle(x_true, viz.robot_size), cvv.BLUE)  # 실제 로봇
+            sim.legend([("lidar scan (last keyframe)", cvv.MAGENTA, "dot"), ("true", cvv.BLUE, "line"),
+                        ("dead reckoning", cvv.BLACK, "line"), ("ICP SLAM (keyframes)", cvv.RED, "line"),
+                        ("loop closure", cvv.GREEN, "line"), ("keyframe in a closed loop", cvv.GREEN, "dot"),
+                        ("checkpoints", cvv.ORANGE, "x")])
+
+            draw_map_panels(panels, map_img, map_eval, room, viz, kp, x_true)
+            panels["map"].dots(kp[loop_ids, :2], cvv.GREEN, 3, edge=cvv.DARK_GREEN)
+            win.show(map_titles("ICP SLAM", ic, map_eval) +
+                     ["v=%.1f m/s  yaw_rate=%.1f rad/s  t=%.1fs  keyframes=%d  loops=%d\n"
+                      "left click: add checkpoint  right click: clear  esc: quit"
+                      % (cmd["v"], cmd["yaw_rate"], time, len(kp), len(loops))], frame_time)
 
     return graph, np.array(kf_true), np.array(kf_dr), builder
 

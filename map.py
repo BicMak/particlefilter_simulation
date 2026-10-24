@@ -28,6 +28,7 @@ import os
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.spatial import cKDTree
 
 from config import Config, RoomConfig
 
@@ -93,6 +94,8 @@ class GridMap:
         self.x_min, self.x_max = 0.0, self.width * resolution
         self.y_min, self.y_max = 0.0, self.height * resolution
         self.rf_id = self.sample_wall_points(n_ref, rng)
+        self._segments = None  # 벽과 방의 경계선 (boundary_segments 에서 처음 쓸 때 만듦)
+        self._segment_tree = None
 
     @classmethod
     def from_image(cls, path, resolution=0.03, wall_thresh=200, close_px=5, n_ref=60, rng=None):
@@ -128,6 +131,66 @@ class GridMap:
             return False
         return not self.grid[row, col]
 
+    def is_wall(self, points):
+        """점들 (n, 2) 이 벽 픽셀 안이거나 지도 밖이면 True (n,)"""
+        pts = np.asarray(points, dtype=float).reshape(-1, 2)
+        cols = np.floor(pts[:, 0] / self.resolution).astype(int)
+        rows = self.height - 1 - np.floor(pts[:, 1] / self.resolution).astype(int)
+        inside = (rows >= 0) & (rows < self.height) & (cols >= 0) & (cols < self.width)
+        wall = np.ones(len(pts), dtype=bool)
+        wall[inside] = self.grid[rows[inside], cols[inside]]
+        return wall
+
+    # ---------------- 벽과 방의 경계선 ----------------
+    def boundary_segments(self):
+        """
+        벽과 방의 경계선. (n, 4) 배열이고 각 행이 선분 [x1, y1, x2, y2] [m].
+
+        픽셀 (row, col) 은 월드의 정사각형 x ∈ [col * res, (col + 1) * res], y ∈ [(H-1-row) * res, (H-row) * res] 이다.
+        이웃한 두 픽셀이 하나는 벽, 하나는 빈 공간이면 그 사이 변(길이 res)이 경계선이다. 지도 밖은 벽으로 본다.
+        raycast 도 같은 규칙이라, 노이즈 없는 라이다 끝점은 정확히 이 선분 위에 떨어진다.
+        """
+        if self._segments is None:
+            res, H = self.resolution, self.height
+            g = np.pad(self.grid, 1, constant_values=True)  # 지도 밖 = 벽
+            # 세로 경계선: 가로로 붙은 두 픽셀이 다름. 원래 픽셀 (r, c-1) 과 (r, c) 사이 = x 가 c * res 인 선
+            r, c = np.nonzero(g[1:-1, :-1] != g[1:-1, 1:])
+            vertical = np.column_stack((c * res, (H - 1 - r) * res, c * res, (H - r) * res))
+            # 가로 경계선: 세로로 붙은 두 픽셀이 다름. 원래 픽셀 (r-1, c) 와 (r, c) 사이 = y 가 (H - r) * res 인 선
+            r, c = np.nonzero(g[:-1, 1:-1] != g[1:, 1:-1])
+            horizontal = np.column_stack((c * res, (H - r) * res, (c + 1) * res, (H - r) * res))
+            self._segments = np.vstack((vertical, horizontal)).astype(float)
+            # 가까운 선분을 빨리 찾기 위한 KD-tree (선분 중점으로)
+            self._segment_tree = cKDTree((self._segments[:, :2] + self._segments[:, 2:]) / 2.0)
+        return self._segments
+
+    def distance_to_boundary(self, points):
+        """
+        점들 (n, 2) 에서 가장 가까운 경계선까지의 거리 (n,) [m]. 방 쪽이면 +, 벽 안(또는 지도 밖)이면 -.
+
+        선분이 만 개가 넘어서 전부 계산하지 않고, 중점이 가까운 후보 k 개만 정확히 계산한다.
+        선분 길이가 res 라서 진짜 가장 가까운 선분의 중점은 (가장 가까운 거리 + res/2) 안에 있다.
+        후보 중 가장 먼 중점이 그보다 가까우면 놓친 선분이 있을 수 있어서, 그 점만 후보를 두 배로 늘려 다시 찾는다.
+        """
+        seg = self.boundary_segments()
+        pts = np.asarray(points, dtype=float).reshape(-1, 2)
+        dist = np.zeros(len(pts))
+        todo, k = np.arange(len(pts)), 8
+        while len(todo):
+            k_eff = min(k, len(seg))
+            mid_d, idx = self._segment_tree.query(pts[todo], k=k_eff)
+            mid_d, idx = mid_d.reshape(len(todo), -1), idx.reshape(len(todo), -1)
+            s = seg[idx]  # (m, k, 4) 후보 선분
+            px, py = pts[todo, 0:1], pts[todo, 1:2]
+            # 축에 평행한 선분이라, x 와 y 각각 선분 범위를 벗어난 만큼이 그 방향 거리
+            dx = np.maximum(np.maximum(np.minimum(s[..., 0], s[..., 2]) - px, px - np.maximum(s[..., 0], s[..., 2])), 0.0)
+            dy = np.maximum(np.maximum(np.minimum(s[..., 1], s[..., 3]) - py, py - np.maximum(s[..., 1], s[..., 3])), 0.0)
+            d = np.hypot(dx, dy).min(axis=1)
+            dist[todo] = d
+            sure = (mid_d[:, -1] >= d + self.resolution / 2.0) | (k_eff == len(seg))
+            todo, k = todo[~sure], k * 2
+        return np.where(self.is_wall(pts), -dist, dist)
+
     def is_visible(self, x0, y0, x1, y1, tol=0.3):
         """
         (x0, y0) 에서 (x1, y1) 의 벽 위 점이 보이는지 (사이에 다른 벽이 가리지 않는지).
@@ -150,31 +213,55 @@ class GridMap:
     def raycast(self, x, y, yaw, fov, max_range, n_rays):
         """
         (x, y) 에서 yaw 방향 +- fov/2 안을 같은 간격으로 나눈 방향으로 광선 n_rays 개를 한꺼번에 쏴서,
-        각 광선이 처음 만나는 벽 위의 점을 돌려준다. (진짜 라이다처럼 시야각을 왼쪽 끝 -> 오른쪽 끝으로 훑음)
+        각 광선이 처음 만나는 벽과 방의 경계선 위의 점을 정확히 돌려준다. (진짜 라이다처럼 시야각을 왼쪽 끝 -> 오른쪽 끝으로 훑음)
         미리 뽑아둔 레퍼런스 대신 "로봇이 지금 시야각 안에서 실제로 보는 벽" 을 관측점으로 쓰기 위한 함수.
-        광선이 벽을 못 만나고 지도/최대거리를 벗어나면 그 광선은 버린다.
+
+        [DDA (Amanatides & Woo)]
+          광선이 지나가는 픽셀을 경계를 넘을 때마다 하나씩 따라간다. 광선이 다음 세로 격자선 / 가로 격자선을 만나는
+          거리(t_max_x, t_max_y) 중 가까운 쪽으로 한 칸 넘어가고, 넘어간 칸이 벽이면 그 경계를 넘은 지점이 끝점이다.
+          일정 간격으로 찍어 보는 방식과 달리 벽 모서리를 건너뛰지 않고, 끝점이 경계선(boundary_segments)에 정확히 놓인다.
+        지도 밖은 벽으로 본다. max_range 안에서 벽을 못 만난 광선은 버린다.
           return : (n, 2) 월드 좌표 [x, y]  (각도가 작은 광선부터 순서대로)
         """
+        res = self.resolution
         limit = min(max_range, math.hypot(self.x_max, self.y_max))  # 거리 제한이 inf 여도 지도 크기까지만
-        step = self.resolution * 0.5  # 벽을 건너뛰지 않도록 한 칸의 절반씩 전진
-        r = np.arange(step, limit, step)  # (R,) 광선 위에서 확인할 거리들
         # 시야각 안을 균등하게 n_rays 등분 (가장자리가 시야각 밖으로 새지 않게 살짝 안쪽). 1개면 정면만
         if n_rays == 1:
             angles = np.array([yaw])
         else:
             angles = yaw + np.linspace(-fov / 2.0, fov / 2.0, n_rays) * 0.999  # (A,)
-        # 모든 광선 x 모든 거리의 좌표를 한 번에 계산: (A, R)
-        xs = x + r[None, :] * np.cos(angles)[:, None]
-        ys = y + r[None, :] * np.sin(angles)[:, None]
-        cols = (xs / self.resolution).astype(int)
-        rows = self.height - 1 - (ys / self.resolution).astype(int)
-        inside = (rows >= 0) & (rows < self.height) & (cols >= 0) & (cols < self.width)
-        hit = np.zeros(xs.shape, dtype=bool)
-        hit[inside] = self.grid[rows[inside], cols[inside]]
-        got = hit.any(axis=1)  # 벽을 만난 광선만
-        first = np.argmax(hit, axis=1)  # 광선마다 처음 벽을 만난 지점
-        idx = np.nonzero(got)[0]
-        return np.column_stack((xs[idx, first[idx]], ys[idx, first[idx]])).reshape(-1, 2)
+        n = len(angles)
+        dx, dy = np.cos(angles), np.sin(angles)
+        ix = np.full(n, math.floor(x / res))  # 지금 칸 (열). y 쪽 칸 번호 iy 는 아래에서부터 셈 (행 = height - 1 - iy)
+        iy = np.full(n, math.floor(y / res))
+        step_x, step_y = np.sign(dx).astype(int), np.sign(dy).astype(int)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            # 다음 세로/가로 격자선까지의 거리, 격자선 사이 간격 (광선과 평행하면 무한대)
+            t_max_x = np.where(dx > 0, ((ix + 1) * res - x) / dx, np.where(dx < 0, (ix * res - x) / dx, np.inf))
+            t_max_y = np.where(dy > 0, ((iy + 1) * res - y) / dy, np.where(dy < 0, (iy * res - y) / dy, np.inf))
+            t_delta_x = np.where(dx != 0, res / np.abs(dx), np.inf)
+            t_delta_y = np.where(dy != 0, res / np.abs(dy), np.inf)
+
+        t_hit = np.full(n, np.nan)
+        active = np.arange(n)  # 아직 벽을 못 만난 광선
+        while len(active):
+            a = active
+            cross_x = t_max_x[a] < t_max_y[a]  # True: 세로 격자선을 먼저 넘음 (옆 칸으로), False: 가로 격자선 (위/아래 칸으로)
+            t = np.where(cross_x, t_max_x[a], t_max_y[a])  # 이번에 넘는 경계까지의 거리
+            ix[a] += np.where(cross_x, step_x[a], 0)
+            iy[a] += np.where(cross_x, 0, step_y[a])
+            t_max_x[a] += np.where(cross_x, t_delta_x[a], 0.0)
+            t_max_y[a] += np.where(cross_x, 0.0, t_delta_y[a])
+            rows, cols = self.height - 1 - iy[a], ix[a]
+            inside = (rows >= 0) & (rows < self.height) & (cols >= 0) & (cols < self.width)
+            wall = np.ones(len(a), dtype=bool)  # 지도 밖 = 벽
+            wall[inside] = self.grid[rows[inside], cols[inside]]
+            in_range = t <= limit
+            hit = wall & in_range
+            t_hit[a[hit]] = t[hit]
+            active = a[~wall & in_range]
+        got = ~np.isnan(t_hit)
+        return np.column_stack((x + t_hit[got] * dx[got], y + t_hit[got] * dy[got])).reshape(-1, 2)
 
     def wall_pixels_world(self):
         """모든 벽 픽셀의 월드 좌표 (N, 2)"""

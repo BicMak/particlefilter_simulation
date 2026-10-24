@@ -33,16 +33,15 @@ PythonRobotics 의 SLAM/GraphBasedSLAM/graph_based_slam.py (Atsushi Sakai) 를 �
 import dataclasses
 import math
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Polygon, Wedge
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 
 from config import Config
-from lidar_to_grid_map import MapBuilder, scan_to_world
+from lidar_to_grid_map import MapBuilder, grid_match, scan_to_world
 from map import build_map
-from particle_filter import Robot, draw_map
+from particle_filter import Robot
+from utils import cv_viewer as cvv
 
 
 def pi_2_pi(angle):
@@ -242,16 +241,128 @@ def lidar_scan(world, x_true, robot, n_rays, range_sigma):
     return d + np.random.randn(len(d)) * range_sigma, bearings
 
 
-def build_grid(room, mapping, poses, scans):
-    """키프레임 위치와 그때의 스캔으로 지도를 처음부터 다시 만든다 (log-odds 는 되돌릴 수 없어서 매번 새로)"""
-    builder = MapBuilder.from_map(
+def empty_grid(room, mapping):
+    """설정(MappingConfig)대로 room 과 같은 범위의 빈 격자 지도를 만든다"""
+    return MapBuilder.from_map(
         room, mapping.resolution, mapping.use_flood_fill,
         l_free=mapping.l_free, l_occ=mapping.l_occ, l_min=mapping.l_min, l_max=mapping.l_max,
         occ_thresh=mapping.occ_thresh, free_thresh=mapping.free_thresh)
+
+
+def build_grid(room, mapping, poses, scans):
+    """키프레임 위치와 그때의 스캔으로 지도를 처음부터 다시 만든다 (log-odds 는 되돌릴 수 없어서 매번 새로)"""
+    builder = empty_grid(room, mapping)
     for pose, (ranges, bearings) in zip(poses, scans):
         if len(ranges):
             builder.update(pose, scan_to_world(pose, ranges, bearings))
     return builder
+
+
+class MapEval:
+    """
+    지도 평가 (VizConfig.show_map_eval). 정답 지도(입력 이미지)의 벽과 방의 경계선(map.GridMap.boundary_segments)을 기준으로 두 가지를 본다.
+
+    [가운데 칸: 라이다 끝점] SLAM 위치가 맞나
+      끝점 = 키프레임 위치 + 그때 잰 거리, 각도 (scan_to_world). 경계선까지 거리를 격자 없이 정확히 잰다 (방 쪽 +, 벽 안쪽 -).
+      라이다(raycast)도 같은 경계선을 맞히기 때문에, 위치가 맞고 센서 노이즈가 없으면 거리는 정확히 0 이다.
+      같은 스캔을 정답 위치(센서 노이즈만 남은 바닥) / Dead Reckoning 위치(보정 없음)로 찍은 값과 같이 본다.
+
+    [왼쪽 칸: 점유 격자 지도] 최종 지도가 실제 지도와 맞나 (lidar_to_grid_map.grid_match)
+      지도에서 정해진 칸(빈 칸 / 벽 칸) 중 실제 지도와 맞는 칸의 비율. 빈 칸은 실제로도 바닥이면, 벽 칸은 실제 벽에 붙어 있으면 맞음.
+      같은 스캔을 정답 위치로 그린 지도(설정은 같음)의 비율도 같이 낸다 = 위치가 완벽할 때의 값
+
+    정답 / Dead Reckoning 위치는 나중에 바뀌지 않아서 키프레임마다 한 번만 계산해 쌓는다 (정답 위치 지도도 이어서 그림).
+    SLAM 위치는 최적화마다 바뀌어서 전부 다시 계산한다.
+    """
+
+    def __init__(self, room, mapping, world):
+        self.world = world
+        self.tol = mapping.eval_tol
+        self.color_max = mapping.eval_color_max
+        self.cell = mapping.resolution if mapping.resolution is not None else world.resolution
+        self.walls = cvv.wall_image(world)  # 가운데 칸 배경 (정답 벽)
+        self.true_map = empty_grid(room, mapping)  # 정답 위치로 그린 점유 지도 (왼쪽 칸 비교용)
+        self.ref = {"true": [], "dr": []}  # 키프레임마다 기준 위치로 찍은 끝점의 경계선까지 거리
+        self.scores = None
+        self.points = np.zeros((0, 2))  # SLAM 위치로 찍은 끝점 (그리기용, 오차가 작은 것부터)
+        self.colors = np.zeros((0, 3), np.uint8)
+        self.wrong = None  # SLAM 지도에서 실제 지도와 안 맞는 칸 (왼쪽 칸에 파랑)
+        self._line_mask = None  # 왼쪽 칸에 겹칠 정답 경계선 (패널 크기, 처음 그릴 때 만듦)
+
+    def add_scan(self, pose_true, pose_dr, ranges, bearings):
+        """키프레임 스캔 하나를 기준 위치 두 개로 찍어서 쌓는다 (정답 위치 지도에도 더함)"""
+        if len(ranges):
+            pts_true = scan_to_world(pose_true, ranges, bearings)
+            self.true_map.update(pose_true, pts_true)  # build_grid 와 같은 순서, 같은 갱신 -> 정답 위치로 다시 만든 지도와 똑같음
+            self.ref["true"].append(self.world.distance_to_boundary(pts_true))
+            self.ref["dr"].append(self.world.distance_to_boundary(scan_to_world(pose_dr, ranges, bearings)))
+
+    @staticmethod
+    def stats(d):
+        """(|거리| 평균, |거리| 95%, 거리 평균) [m]. 마지막은 부호 있는 평균 (+ 면 끝점이 방 쪽으로 떠 있음)"""
+        if len(d) == 0:
+            return math.nan, math.nan, math.nan
+        return float(np.mean(np.abs(d))), float(np.percentile(np.abs(d), 95)), float(np.mean(d))
+
+    def evaluate(self, builder, poses, scans):
+        """SLAM 위치(키프레임마다)와 스캔, SLAM 점유 지도로 점수를 낸다 (최적화할 때마다)"""
+        pts = [scan_to_world(p, r, b) for p, (r, b) in zip(poses, scans) if len(r)]
+        pts = np.vstack(pts) if pts else np.zeros((0, 2))
+        d = self.world.distance_to_boundary(pts)
+        order = np.argsort(np.abs(d))  # 오차가 큰 점이 위에 그려지게
+        self.points = pts[order]
+        self.colors = cvv.value_colors(np.abs(d[order]), self.color_max)
+
+        grid = grid_match(builder, self.world, self.tol)
+        self.wrong = grid["wrong"]
+        self.scores = {"slam": self.stats(d),
+                       "true": self.stats(np.concatenate(self.ref["true"]) if self.ref["true"] else []),
+                       "dr": self.stats(np.concatenate(self.ref["dr"]) if self.ref["dr"] else []),
+                       "grid": grid,
+                       "grid_true": grid_match(self.true_map, self.world, self.tol)}
+
+    def endpoint_text(self, name):
+        """
+        가운데 칸 점수 (세 줄). 거리는 끝점에서 실제 벽 경계선까지, 평균 / 95% 는 크기만 본 값이고
+        bias 는 부호를 살린 평균: + 면 끝점이 벽 앞(방 쪽)에 떠 있고, - 면 벽 안쪽으로 파고든 쪽으로 치우쳤다는 뜻
+        """
+        if self.scores is None:
+            return "(waiting for the first optimization)\n\n"
+        slam, true, dr = (100 * np.array(self.scores[key]) for key in ("slam", "true", "dr"))  # [cm]
+        side = "in front of the wall" if slam[2] > 0 else "inside the wall"
+        return ("%s: points are %.1f cm off on average, 95%% are within %.1f cm\n"
+                "same scans on true pose %.1f / %.1f cm, on odometry only (no SLAM) %.1f / %.1f cm\n"
+                "bias %+.1f cm: points lean %s (+ in front, - inside)"
+                % (name, *slam[:2], *true[:2], *dr[:2], slam[2], side))
+
+    def grid_text(self, name):
+        """왼쪽 칸 점수 (두 줄): 지도에서 정해진 칸 중 실제 지도와 맞는 칸의 비율 (SLAM 지도 / 정답 위치로 그린 지도)"""
+        if self.scores is None:
+            return "(waiting for the first optimization)\n"
+        g, t = self.scores["grid"], self.scores["grid_true"]
+        return ("%s map: %.1f%% of cells match (free cells %.1f%%, wall cells %.1f%%)\n"
+                "true pose map: %.1f%% (free cells %.1f%%, wall cells %.1f%%)"
+                % (name, 100 * g["all"], 100 * g["free"], 100 * g["wall"],
+                   100 * t["all"], 100 * t["free"], 100 * t["wall"]))
+
+    def draw(self, panel):
+        """가운데 칸: 정답 벽 (회색) 위에 SLAM 끝점을 경계선까지 거리에 따라 초록(0) ~ 빨강(color_max 이상) 으로 찍는다"""
+        panel.paint(*self.walls)
+        # 화면 한 픽셀이 클수록(멀리 볼수록) 점을 키워서 보이게. 확대해서 보면 1 픽셀
+        size = 1 if panel.meters_to_px(0.1) >= 2 else 2
+        panel.pixels(self.points, self.colors, size)
+
+    def draw_grid(self, panel, map_img, extent):
+        """왼쪽 칸: 점유 지도에서 실제 지도와 안 맞는 칸을 파랑으로 칠하고, 실제 벽 경계선을 어둡게 겹친다.
+        왼쪽 칸은 항상 지도 전체라 경계선 그림은 한 번만 만듦"""
+        img = map_img
+        if self.wrong is not None and self.wrong.shape == map_img.shape[:2]:
+            img = map_img.copy()
+            img[self.wrong] = cvv.BLUE
+        panel.paint(img, extent)
+        if self._line_mask is None or self._line_mask.shape != (panel.h, panel.w):
+            self._line_mask = panel.line_mask(self.world.boundary_segments())
+        panel.img[self._line_mask] = (panel.img[self._line_mask] * 0.3).astype(np.uint8)  # 밑의 색이 비치게 어둡게만
 
 
 def robot_triangle(pose, size):
@@ -277,6 +388,62 @@ def follow_view(room, x, y, view_radius):
     return cx - half_w, cx + half_w, cy - half_h, cy + half_h
 
 
+def make_window(name, room, viz, map_eval, waypoints):
+    """
+    SLAM 화면 (cv2): [격자 지도 | 지도 평가 (map_eval 이 있을 때) | 시뮬레이션].
+    어느 패널이든 왼쪽 클릭하면 그 자리에 체크포인트 추가, 오른쪽 클릭하면 전부 지움.
+      return : (Window, {"map": Panel, "eval": Panel, "sim": Panel})
+    """
+    h = viz.panel_px
+    w = h * (room.x_max - room.x_min) / (room.y_max - room.y_min)  # 지도와 같은 가로세로 비율
+    full = (room.x_min, room.x_max, room.y_min, room.y_max)
+    panels = {"map": cvv.Panel(w, h, full)}
+    if map_eval is not None:
+        panels["eval"] = cvv.Panel(w, h, full)
+    panels["sim"] = cvv.Panel(w, h, full)
+
+    def on_click(left, x, y):
+        if left:
+            waypoints.append([x, y])
+        else:
+            waypoints.clear()
+
+    return cvv.Window(name, list(panels.values()), title_lines=4, on_click=on_click), panels
+
+
+def draw_map_panels(panels, map_img, map_eval, room, viz, kp, x_true):
+    """
+    격자 지도 패널과 지도 평가 패널: 지도 그림 + 최적화된 키프레임 (빨강) + 실제 로봇 위치 (파랑).
+    지도 평가 패널은 VizConfig.eval_view_radius 가 있으면 로봇을 따라다니며 확대해서 보여 준다.
+    """
+    full = (room.x_min, room.x_max, room.y_min, room.y_max)
+    for key in ("map", "eval"):
+        if key not in panels:
+            continue
+        p = panels[key]
+        if key == "map" and map_eval is not None:
+            map_eval.draw_grid(p, map_img, full)
+        elif key == "map":
+            p.paint(map_img, full)
+        else:
+            p.view = follow_view(room, x_true[0], x_true[1], viz.eval_view_radius)
+            map_eval.draw(p)
+        p.polyline(kp[:, :2], cvv.RED)
+        p.dots(kp[:, :2], cvv.RED, 2)
+        p.dots([x_true[:2]], cvv.BLUE, 5, edge=cvv.BLACK)
+
+
+def map_titles(name, gs, map_eval):
+    """격자 지도 / 지도 평가 패널의 제목"""
+    if map_eval is None:
+        return ["grid map from %s poses (rebuilt every %.0fs)\ngreen=free  red=occupied  white=unknown"
+                % (name, gs.optimize_every)]
+    return ["grid map cells that match the real map  (black = real wall, blue = wrong cell)\n%s"
+            % map_eval.grid_text(name),
+            "how far lidar points are from the real wall (green = on it, red = %.0fcm+ off)\n%s"
+            % (100 * map_eval.color_max, map_eval.endpoint_text(name))]
+
+
 def go_to_goal(pose, goal, gs):
     """
     체크포인트로 가는 속도/각속도. 도착했으면 None.
@@ -291,11 +458,6 @@ def go_to_goal(pose, goal, gs):
     yaw_rate = float(np.clip(gs.k_w * err, -gs.yaw_rate_max, gs.yaw_rate_max))
     v = min(gs.k_v * dist, gs.v_max) * max(math.cos(err), 0.0)
     return v, yaw_rate
-
-
-def mean_error(est, true):
-    """키프레임 위치 오차의 평균 [m]"""
-    return float(np.mean(np.hypot(est[:, 0] - true[:, 0], est[:, 1] - true[:, 1]))) if len(est) else 0.0
 
 
 def main(config=None):
@@ -318,33 +480,21 @@ def main(config=None):
     time, next_kf, next_opt = 0.0, 0.0, gs.optimize_every
     cmd = {"v": 0.0, "yaw_rate": 0.0}
     waypoints = [list(map(float, w)) for w in gs.waypoints]  # 남은 체크포인트 (앞에서부터 차례로)
-    state = {"quit": False}
     stuck_steps = 0  # 벽에 막혀 못 움직인 연속 step 수
 
-    fig = ax_map = ax_sim = None
-    map_dirty = False  # 지도를 새로 만들었으면 왼쪽 패널을 다시 그림
-    map_robot = None  # 왼쪽 지도 위의 실제 로봇 위치 점
-    sim = None  # 오른쪽 화면의 그림 객체들 (처음 그릴 때 만듦)
+    win = panels = map_eval = None
+    map_dirty = False  # 지도를 새로 만들었으면 지도 그림을 새로 만듦
     step_count = 0
     if viz.show_animation:
-        fig, (ax_map, ax_sim) = plt.subplots(1, 2, figsize=(2 * viz.figsize[0], viz.figsize[1]),
-                                             gridspec_kw={"wspace": 0.3})
-
-        def on_click(event):
-            """왼쪽 클릭: 체크포인트 추가 (두 화면 어디든 월드 좌표로 찍힘), 오른쪽 클릭: 전부 지움"""
-            if event.inaxes not in (ax_sim, ax_map) or event.xdata is None:
-                return
-            if event.button == 1:
-                waypoints.append([event.xdata, event.ydata])
-            elif event.button == 3:
-                waypoints.clear()
-
-        fig.canvas.mpl_connect('button_press_event', on_click)
-        fig.canvas.mpl_connect('key_press_event', lambda e: e.key == 'escape' and state.update(quit=True))
-        fig.canvas.mpl_connect('close_event', lambda e: state.update(quit=True))
+        # 지도 평가는 정답 격자(이미지 지도)가 있을 때만
+        map_eval = MapEval(room, mapping, world) if viz.show_map_eval and hasattr(room, "grid") else None
+        win, panels = make_window("graph SLAM", room, viz, map_eval, waypoints)
+        walls = cvv.wall_image(room)  # 시뮬레이션 패널 배경 (정답 벽)
+        map_img = np.full((1, 1, 3), 255, np.uint8)  # 격자 지도 그림 (첫 최적화 전에는 빈 그림)
+        frame_time = robot.dt * gs.draw_every / viz.sim_speed if viz.sim_speed else 0.0
 
     # 화면이 있으면 창을 닫거나 esc 를 누를 때까지, 화면이 없으면 sim_time 동안 돈다
-    while (viz.show_animation or cfg.sim_time >= time) and not state["quit"]:
+    while (viz.show_animation or cfg.sim_time >= time) and not (win is not None and win.closed):
         time += robot.dt
 
         # 1. 체크포인트로 가는 입력 계산 -> 이동 + 관측 (z 의 각 행: [노이즈 낀 거리, 레퍼런스 x, 레퍼런스 y, 빔 각도])
@@ -378,6 +528,8 @@ def main(config=None):
             scans.append(lidar_scan(world, x_true, robot, gs.n_scan_rays, range_sigma))
             kf_true.append(x_true)
             kf_dr.append(x_dr)
+            if map_eval is not None:
+                map_eval.add_scan(x_true, x_dr, *scans[-1])
 
         # 3. 그래프 최적화 -> 최적화된 위치로 지도를 다시 그림
         if time >= next_opt:
@@ -385,75 +537,49 @@ def main(config=None):
             itr, cost = graph.optimize()
             builder = build_grid(room, mapping, graph.poses, scans) if world is not None else None
             map_dirty = True
-            print("t=%.1fs  nodes=%d  odo edges=%d  landmark edges=%d  iter=%d  cost=%.1f  "
-                  "mean error: DR %.2f m -> graph %.2f m"
-                  % (time, len(graph.poses), len(graph.odo), len(graph.landmark_pairs()), itr, cost,
-                     mean_error(np.array(kf_dr), np.array(kf_true)), mean_error(graph.poses, np.array(kf_true))))
+            print("t=%.1fs  nodes=%d  odo edges=%d  landmark edges=%d  iter=%d  cost=%.1f"
+                  % (time, len(graph.poses), len(graph.odo), len(graph.landmark_pairs()), itr, cost))
+            if map_eval is not None and builder is not None:
+                map_eval.evaluate(builder, graph.poses, scans)
+                print("  endpoints: " + "   ".join(map_eval.endpoint_text("graph SLAM").split("\n")[:2]))  # 세 번째 줄(bias 설명)은 화면에만
+                print("  grid map:  " + map_eval.grid_text("graph SLAM").replace("\n", "   "))
 
-        # 4. 그리기 (draw_every step 마다 한 번. matplotlib 은 매번 그림 전체를 다시 그려서 계산보다 훨씬 느림)
+        # 4. 그리기 (cv2: 지도는 그림으로 들고 있다가 보이는 부분만 붙이고, 선/점/글자만 덧그림)
         step_count += 1
-        if viz.show_animation and (step_count % gs.draw_every == 0 or map_dirty):
-            ht, hd, kp = np.array(h_true), np.array(h_dr), graph.poses
-
-            # 오른쪽: 시뮬레이션 (로봇을 따라다니는 화면)
-            # 벽, 랜드마크, 선, 삼각형은 처음 한 번만 만들고 매 step 데이터만 바꾼다 (매번 지우고 다시 그리면 매우 느림)
-            if sim is None:
-                plt.sca(ax_sim)
-                room.plot(show_ref=True)  # 벽 (회색) + 랜드마크 (검은 별)
-                sim = {
-                    "obs": ax_sim.plot([], [], "--k", linewidth=0.8)[0],  # 실제 로봇 -> 이번에 관측한 랜드마크
-                    "fov": ax_sim.add_patch(Wedge((0, 0), min(robot.max_range, viz.fov_draw_radius), 0, 0,
-                                                  color="m", alpha=0.12, lw=0)),  # 시야각 부채꼴
-                    "true": ax_sim.plot([], [], "--b", linewidth=2.0, label="true")[0],  # 실제 궤적
-                    "dr": ax_sim.plot([], [], "-k", linewidth=1.0, label="dead reckoning")[0],  # 오도메트리만
-                    "graph": ax_sim.plot([], [], ".-r", label="graph SLAM (keyframes)")[0],  # 최적화된 키프레임
-                    "route": ax_sim.plot([], [], ":", color="darkorange", linewidth=1.5)[0],  # 로봇 -> 남은 체크포인트
-                    "goals": ax_sim.plot([], [], "X", color="darkorange", ms=9, label="checkpoints")[0],
-                    "robot": ax_sim.add_patch(Polygon(np.zeros((3, 2)), closed=True, facecolor="royalblue",
-                                                      edgecolor="k", zorder=5)),  # 실제 로봇 (삼각형)
-                }
-                ax_sim.set_aspect("equal", adjustable="box")
-                ax_sim.grid(True)
-                ax_sim.legend(loc="upper right", fontsize=8)
-            # 관측 선: 선분 사이를 NaN 으로 끊어서 선 객체 하나로 그림
-            seg = np.full((3 * len(z), 2), np.nan)
-            seg[0::3] = x_true[:2]
-            seg[1::3] = z[:, 1:3]
-            sim["obs"].set_data(seg[:, 0], seg[:, 1])
-            yaw_deg, half_deg = math.degrees(x_true[2]), math.degrees(robot.fov) / 2.0
-            sim["fov"].set_center((x_true[0], x_true[1]))
-            sim["fov"].set_theta1(yaw_deg - half_deg)
-            sim["fov"].set_theta2(yaw_deg + half_deg)
-            sim["true"].set_data(ht[:, 0], ht[:, 1])
-            sim["dr"].set_data(hd[:, 0], hd[:, 1])
-            sim["graph"].set_data(kp[:, 0], kp[:, 1])
-            wp = np.array(waypoints).reshape(-1, 2)
-            sim["goals"].set_data(wp[:, 0], wp[:, 1])
-            route = np.vstack((x_true[:2], wp))
-            sim["route"].set_data(route[:, 0], route[:, 1])
-            sim["robot"].set_xy(robot_triangle(x_true, viz.robot_size))
-            x_lo, x_hi, y_lo, y_hi = follow_view(room, x_true[0], x_true[1], viz.view_radius)
-            ax_sim.set_xlim(x_lo, x_hi)
-            ax_sim.set_ylim(y_lo, y_hi)
-            ax_sim.set_title("v=%.1f m/s  yaw_rate=%.1f rad/s  t=%.1fs  keyframes=%d\n"
-                             "[left click: add checkpoint, right click: clear, esc: quit]"
-                             % (cmd["v"], cmd["yaw_rate"], time, len(kp)), fontsize=9)
-
-            # 왼쪽: 최적화된 위치로 다시 만든 지도 (지도가 바뀔 때만 다시 그리고, 로봇 점만 매 step 옮김)
-            if map_dirty or map_robot is None:
+        if win is not None and (step_count % gs.draw_every == 0 or map_dirty):
+            if map_dirty:
                 map_dirty = False
-                ax_map.cla()
                 if builder is not None:
-                    draw_map(ax_map, builder, max_grid_cells=0)  # 칸 경계선은 생략 (눈금이 수백 개라 매 프레임 그리기가 매우 느려짐)
-                ax_map.plot(kp[:, 0], kp[:, 1], ".-r", ms=3)
-                map_robot, = ax_map.plot([], [], "o", color="royalblue", ms=6)
-                ax_map.set_xlim(room.x_min, room.x_max)
-                ax_map.set_ylim(room.y_min, room.y_max)
-                ax_map.set_aspect("equal", adjustable="box")
-                ax_map.set_title("grid map rebuilt from graph SLAM poses\n(updated every %.0fs)"
-                                 % gs.optimize_every, fontsize=9)
-            map_robot.set_data([x_true[0]], [x_true[1]])
-            plt.pause(0.001)
+                    map_img = cvv.occupancy_image(builder)
+            ht, hd, kp = np.array(h_true), np.array(h_dr), graph.poses
+            wp = np.array(waypoints).reshape(-1, 2)
+
+            # 시뮬레이션 (로봇을 따라다니는 화면)
+            sim = panels["sim"]
+            sim.view = follow_view(room, x_true[0], x_true[1], viz.view_radius)
+            sim.paint(*walls)  # 벽 (회색)
+            if not hasattr(room, "grid"):
+                sim.rect(room.x_min, room.x_max, room.y_min, room.y_max, cvv.GRAY)  # 사각형 방의 벽
+            sim.markers(room.rf_id, cvv.BLACK)  # 랜드마크 (검은 별)
+            sim.sector(x_true[:2], min(robot.max_range, viz.fov_draw_radius),
+                       x_true[2] - robot.fov / 2.0, x_true[2] + robot.fov / 2.0, cvv.MAGENTA)  # 시야각
+            sim.segments(np.repeat(x_true[None, :2], len(z), axis=0), z[:, 1:3], cvv.BLACK)  # 이번에 관측한 랜드마크
+            sim.polyline(hd[:, :2], cvv.BLACK)  # Dead Reckoning 궤적
+            sim.polyline(ht[:, :2], cvv.BLUE, 2)  # 실제 궤적
+            sim.polyline(kp[:, :2], cvv.RED)  # 최적화된 키프레임
+            sim.dots(kp[:, :2], cvv.RED, 2)
+            sim.polyline(np.vstack((x_true[:2], wp)), cvv.ORANGE)  # 로봇 -> 남은 체크포인트
+            sim.markers(wp, cvv.ORANGE, kind="x", size=11, thickness=2)
+            sim.polygon(robot_triangle(x_true, viz.robot_size), cvv.BLUE)  # 실제 로봇
+            sim.legend([("true", cvv.BLUE, "line"), ("dead reckoning", cvv.BLACK, "line"),
+                        ("graph SLAM (keyframes)", cvv.RED, "line"), ("landmark", cvv.BLACK, "star"),
+                        ("checkpoints", cvv.ORANGE, "x")])
+
+            draw_map_panels(panels, map_img, map_eval, room, viz, kp, x_true)
+            win.show(map_titles("graph SLAM", gs, map_eval) +
+                     ["v=%.1f m/s  yaw_rate=%.1f rad/s  t=%.1fs  keyframes=%d\n"
+                      "left click: add checkpoint  right click: clear  esc: quit"
+                      % (cmd["v"], cmd["yaw_rate"], time, len(kp))], frame_time)
 
     return graph, np.array(kf_true), np.array(kf_dr), builder
 
